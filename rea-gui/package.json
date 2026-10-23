@@ -1,0 +1,41 @@
+{
+  "name": "rea-gui",
+  "version": "0.1.0",
+  "description": "Local web GUI for REA (Reverse Engineer Anything): run every REA MCP tool from a browser.",
+  "type": "module",
+  "bin": {
+    "rea-gui": "bin/rea-gui.mjs"
+  },
+  "files": [
+    "bin",
+    "lib",
+    "public"
+  ],
+  "scripts": {
+    "start": "node bin/rea-gui.mjs",
+    "smoke": "node test/smoke.mjs",
+    "test": "node test/smoke.mjs && node test/chat.mjs"
+  },
+  "dependencies": {
+    "@anthropic-ai/sdk": "^1.1.0",
+    "rea-agents": "^6.7.0"
+  },
+  "engines": {
+    "node": "^22.19.0 || ^24.11.0 || >=26.0.0"
+  },
+  "keywords": [
+    "rea",
+    "reverse-engineering",
+    "mcp",
+    "gui",
+    "electron",
+    "asar"
+  ],
+  "license": "MIT",
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/dominusmaster/rea-studio.git",
+    "directory": "rea-gui"
+  },
+  "homepage": "https://github.com/dominusmaster/rea-studio#readme"
+}

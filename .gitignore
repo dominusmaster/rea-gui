@@ -1,0 +1,10 @@
+# Upstream REA checkout (github.com/morluto/rea), used locally via REA_BIN
+/rea/
+# Scratch install of rea-agents
+/rea-cli/
+node_modules/
+*.log
+*.tgz
+.DS_Store
+.env
+.env.*
