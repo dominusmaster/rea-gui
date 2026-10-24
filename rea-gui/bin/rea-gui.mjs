@@ -372,9 +372,9 @@ async function listDirectory(path) {
 // ---------- HTTP server ----------
 const token = randomBytes(24).toString("hex");
 const allowedHosts = new Set([`${host}:${port}`, `localhost:${port}`, `127.0.0.1:${port}`]);
-const mime = { ".html": "text/html", ".js": "text/javascript", ".css": "text/css", ".svg": "image/svg+xml", ".png": "image/png" };
+const mime = { ".html": "text/html", ".js": "text/javascript", ".css": "text/css", ".svg": "image/svg+xml", ".png": "image/png", ".ico": "image/x-icon" };
 // Served before sign-in, so the sign-in page can render.
-const PUBLIC_FILES = new Set(["login.html", "style.css", "icon.svg"]);
+const PUBLIC_FILES = new Set(["login.html", "style.css", "icon.svg", "favicon.ico", "apple-touch-icon.png"]);
 
 // Uploads land in their own folder each, keeping the original file name (REA uses it to tell formats apart).
 async function saveUpload(req, name) {
