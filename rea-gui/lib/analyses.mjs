@@ -5,7 +5,7 @@ import { join } from "node:path";
 
 const ID = /^a[0-9a-z]{4,24}$/;
 const KEEP = 50;
-const SUMMARY_KEYS = ["id", "path", "name", "kind", "at", "state", "finishedAt"];
+const SUMMARY_KEYS = ["id", "path", "name", "kind", "at", "state", "finishedAt", "failedChecks"];
 
 export class AnalysisStore {
   constructor(dir) {

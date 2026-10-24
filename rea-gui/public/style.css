@@ -294,6 +294,7 @@ input[type="checkbox"] { width: auto; height: auto; box-shadow: none; }
 .analysis-item .state { width: 14px; flex-shrink: 0; color: var(--muted-foreground); text-align: center; }
 .analysis-item .state.done { color: var(--success); }
 .analysis-item .state.running { color: var(--warning); }
+.analysis-item .state.partial { color: var(--warning); font-weight: 700; }
 #history-list .nav-item { font-size: 13px; }
 #history-list .state { width: 14px; text-align: center; color: var(--muted-foreground); }
 #history-list .type { color: var(--muted-foreground); margin-left: auto; font-size: 12px; }
@@ -852,6 +853,10 @@ main > * { margin-left: max(0px, calc((100cqw - 1200px) / 2)) !important; }
 }
 @media (max-width: 560px) {
   .analysis-head { flex-wrap: wrap; }
+  /* Buttons get their own row so the title, path and date keep the full width. */
+  .analysis-head .grow { flex: 1 1 calc(100% - 72px); min-width: 0; }
+  .analysis-actions { flex: 1 1 100%; }
+  .analysis-actions button { flex: 1; }
   .analysis-chat-open { margin-left: 0; }
 }
 /* Suggested questions are actions: give them the outline-button shape. */

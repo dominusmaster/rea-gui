@@ -548,6 +548,7 @@ export function runAnalysis(deps, detected, kind) {
       for (const card of cards) {
         const entry = await check(card);
         analysis.steps.push(entry);
+        if (entry.status === "failed") analysis.failedChecks = (analysis.failedChecks ?? 0) + 1;
         view.apply(card, entry);
         // Save after every check, so closing the tab mid-run keeps what already finished.
         deps.onChange(analysis);
@@ -686,7 +687,11 @@ function parse(record) {
 }
 
 function failureMessage(record, parsed) {
-  if (record.state === "error") return record.error?.message ?? "REA call failed";
+  if (record.state === "error") {
+    const message = record.error?.message ?? "REA call failed";
+    if (/server exited|not running|restarted/i.test(message)) return "REA restarted while this check was running, so it didn't finish. Run the analysis again.";
+    return message;
+  }
   const error = parsed?.error;
   if (error) {
     const fix = error.remediation?.action && error.remediation.action !== error.message ? ` ${error.remediation.action}` : "";

@@ -54,11 +54,22 @@ function h(tag, props = {}, ...children) {
 }
 
 async function api(path, { method = "GET", body } = {}) {
-  const res = await fetch(path, {
-    method,
-    headers: { "x-rea-gui-token": token, ...(body ? { "content-type": "application/json" } : {}) },
-    body: body ? JSON.stringify(body) : undefined,
-  });
+  let res;
+  try {
+    res = await fetch(path, {
+      method,
+      headers: { "x-rea-gui-token": token, ...(body ? { "content-type": "application/json" } : {}) },
+      body: body ? JSON.stringify(body) : undefined,
+    });
+  } catch {
+    setConnection("lost");
+    throw new Error("Can't reach the REA Studio server. Check that it's still running.");
+  }
+  // Each server start issues a new token, so a 401 means the server restarted under this page.
+  if (res.status === 401) {
+    setConnection("restarted");
+    throw new Error("REA Studio restarted. Reload the page to continue.");
+  }
   const data = await res.json();
   if (!res.ok) throw new Error(data.error ?? `HTTP ${res.status}`);
   return data;
@@ -68,9 +79,13 @@ async function api(path, { method = "GET", body } = {}) {
 function renderStatus() {
   const s = state.status;
   const el = $("#status");
-  el.className = `status ${s?.state ?? ""}`;
+  el.className = `status ${connection === "ok" ? s?.state ?? "" : "stopped"}`;
   const text =
-    s?.state === "ready"
+    connection === "lost"
+      ? "Server not reachable"
+      : connection === "restarted"
+        ? "Server restarted: reload the page"
+        : s?.state === "ready"
       ? `${s.serverInfo?.name ?? "REA"} ${s.serverInfo?.version ?? ""} · ${s.toolCount} tools`
       : s?.state === "starting"
         ? "Starting REA…"
@@ -83,8 +98,43 @@ function renderStatus() {
 }
 
 // Explain a failed REA start in place, with the server's last error lines.
+// ---------- connection to the REA Studio server ----------
+// "ok", "lost" (server unreachable; retried until it's back) or "restarted" (new token: the page must reload).
+let connection = "ok";
+let connectionPoll = null;
+function setConnection(next) {
+  if (connection === next || connection === "restarted") return;
+  connection = next;
+  clearInterval(connectionPoll);
+  if (next === "lost") connectionPoll = setInterval(checkConnection, 3000);
+  renderStatus();
+}
+async function checkConnection() {
+  try {
+    const res = await fetch("/api/status", { headers: { "x-rea-gui-token": token } });
+    setConnection(res.status === 401 ? "restarted" : "ok");
+  } catch {
+    setConnection("lost");
+  }
+}
+
 async function renderBanner() {
   const banner = $("#banner");
+  if (connection !== "ok") {
+    banner.replaceChildren(
+      ...(connection === "lost"
+        ? [
+            h("strong", { text: "Can't reach the REA Studio server. " }),
+            h("span", { text: "It may have stopped. Start it again from the rea-gui folder with npm start; this page reconnects by itself." }),
+          ]
+        : [
+            h("strong", { text: "REA Studio restarted. " }),
+            h("span", { text: "Reload this page to reconnect. Saved analyses are kept." }),
+            h("div", { class: "actions" }, h("button", { class: "primary", text: "Reload page", onclick: () => location.reload() })),
+          ]),
+    );
+    return banner.classList.remove("hidden");
+  }
   const failed = state.status?.state === "failed" || state.status?.state === "stopped";
   if (!failed) return banner.classList.add("hidden");
   let stderr = [];
@@ -121,6 +171,9 @@ const statusReady = new Promise((resolve) => (statusKnown = resolve));
 
 function connectEvents() {
   const events = new EventSource(`/api/events?token=${token}`);
+  events.addEventListener("open", () => setConnection("ok"));
+  // EventSource retries on its own while the server is down, but gives up on a 401 (new token).
+  events.addEventListener("error", () => checkConnection());
   events.addEventListener("status", async (e) => {
     const previous = state.status?.state;
     state.status = JSON.parse(e.data);
@@ -896,17 +949,22 @@ const analysesLoaded = (async () => {
   renderAnalysisList();
 })();
 
+// A saved analysis still marked running, with no page running it here, was cut off (tab closed or reloaded).
+// A finished analysis with a failed check isn't shown as a clean success.
+const shownState = (a) => (a.state === "running" && !a.page ? "interrupted" : a.state === "done" && a.failedChecks ? "partial" : a.state);
+
 function renderAnalysisList() {
   const list = $("#analysis-list");
   list.replaceChildren();
   if (!state.analyses.length) list.append(h("div", { class: "empty", text: "No analyses yet" }));
-  const icon = { running: "◌", done: "✓", stopped: "■", interrupted: "■" };
+  const icon = { running: "◌", done: "✓", partial: "!", stopped: "■", interrupted: "■" };
+  const why = { partial: "Finished, but a check couldn't complete", interrupted: "Didn't finish", stopped: "Stopped" };
   for (const a of state.analyses) {
     list.append(
       h(
         "button",
-        { class: `nav-item analysis-item ${location.hash === `#/analysis/${a.id}` ? "active" : ""}`, title: a.path, onclick: () => (location.hash = `#/analysis/${a.id}`) },
-        h("span", { class: `state ${a.state}`, text: icon[a.state] ?? "•" }),
+        { class: `nav-item analysis-item ${location.hash === `#/analysis/${a.id}` ? "active" : ""}`, title: why[shownState(a)] ? `${a.path}\n${why[shownState(a)]}` : a.path, onclick: () => (location.hash = `#/analysis/${a.id}`) },
+        h("span", { class: `state ${shownState(a)}`, text: icon[shownState(a)] ?? "•" }),
         h("span", { class: "grow", text: a.name }),
         h("span", { class: "type", text: KINDS[a.kind]?.label ?? "" }),
       ),
@@ -956,14 +1014,18 @@ function renderMissingAnalysis() {
 
 const debounce = (fn, ms) => {
   let t;
-  return (...args) => (clearTimeout(t), (t = setTimeout(() => fn(...args), ms)));
+  const debounced = (...args) => (clearTimeout(t), (t = setTimeout(() => fn(...args), ms)));
+  debounced.cancel = () => clearTimeout(t);
+  return debounced;
 };
 
 const SUPPORTED = "Mac apps · Electron apps · Android APK · iOS IPA · Windows EXE/DLL · app.asar and JavaScript projects · Mach-O and Linux binaries · WebAssembly · SQLite";
 
 async function renderHome() {
+  // The home page is redrawn when REA's tools arrive; keep whatever was already typed.
+  const typed = document.getElementById("target-path")?.value ?? "";
   // A visible label and hint sit above the field. The button stays enabled and validates on press.
-  const input = h("input", { id: "target-path", class: "big-input", spellcheck: false, autocomplete: "off" });
+  const input = h("input", { id: "target-path", class: "big-input", spellcheck: false, autocomplete: "off", value: typed });
   const hint = h("div", { class: "detect-hint muted", "aria-live": "polite" });
   const go = h("button", { class: "primary big", text: "Start analysis" });
   let pending = null;
@@ -995,6 +1057,8 @@ async function renderHome() {
   input.addEventListener("input", check);
   input.addEventListener("keydown", (e) => e.key === "Enter" && go.click());
   go.addEventListener("click", async () => {
+    // A check still waiting from the last keystroke would overwrite this press's result.
+    check.cancel();
     if (!input.value.trim()) return showError("Enter the path to an app or file, or pick an installed app below.");
     // Re-check on press so a debounced check still in flight can't start the wrong path.
     await runCheck();
@@ -1020,6 +1084,7 @@ async function renderHome() {
     h("div", { id: "readiness" }),
   );
   input.focus();
+  if (typed.trim()) runCheck();
   renderReadiness();
 
   if (!state.apps) {
@@ -2127,6 +2192,8 @@ function renderChatList() {
 }
 
 async function renderChat() {
+  // Redraws (provider switch, model list arriving, REA's tools loading) keep the half-typed message.
+  const draft = document.getElementById("chat-prompt")?.value ?? "";
   if (!chatState.config) {
     setMain(h("div", { class: "empty", text: "Loading chat…" }));
     await loadChatConfig();
@@ -2163,6 +2230,7 @@ async function renderChat() {
       }
     },
   });
+  prompt.value = draft;
   const effortSelect = h(
     "select",
     { "aria-label": "Effort", onchange: (e) => localStorage.setItem("rea-chat-effort", (chatState.effort = e.target.value)) },
