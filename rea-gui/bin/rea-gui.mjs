@@ -9,6 +9,7 @@ import { homedir, platform, tmpdir } from "node:os";
 import { dirname, extname, join, resolve, sep } from "node:path";
 import { fileURLToPath } from "node:url";
 import { McpStdioClient } from "../lib/mcp-client.mjs";
+import { AnalysisStore } from "../lib/analyses.mjs";
 import { TargetBroker } from "../lib/target.mjs";
 import { AgentSession, MODELS, EFFORTS, DEFAULT_EFFORT, publicAgents } from "../lib/agent.mjs";
 
@@ -30,7 +31,8 @@ Usage: rea-gui [--port N] [--host 127.0.0.1] [--no-open]
 
 Environment:
   REA_BIN    Path to REA's scripts/rea.mjs or a rea executable
-  REA_NODE   Node.js binary used to run REA (must satisfy REA's engines)`);
+  REA_NODE   Node.js binary used to run REA (must satisfy REA's engines)
+  REA_GUI_DATA_DIR  Where saved analyses live (default ~/.rea-gui)`);
   process.exit(0);
 }
 if (flag("version")) {
@@ -107,6 +109,9 @@ let session = null;
 // Call IDs stay unique across REA restarts and GUI relaunches, unlike JSON-RPC request IDs.
 const bootId = randomBytes(4).toString("hex");
 let callSeq = 0;
+// Identifies the running REA process. Evidence IDs from analyses only resolve in the run that made them.
+let reaRun = 0;
+const analyses = new AnalysisStore(join(process.env.REA_GUI_DATA_DIR || join(homedir(), ".rea-gui"), "analyses"));
 let sessionRefresh = null;
 
 // ---------- Chat agent state ----------
@@ -140,6 +145,7 @@ function statusSnapshot() {
     serverInfo: client?.serverInfo ?? null,
     protocolVersion: client?.protocolVersion ?? null,
     toolCount: tools.length,
+    reaSession: `${bootId}-${reaRun}`,
     launch: launch.label,
     guiVersion: pkg.version,
   };
@@ -151,6 +157,7 @@ async function startRea() {
   tools = [];
   session = null;
   broker.reset();
+  reaRun++;
   client = new McpStdioClient({
     command: launch.command,
     args: launch.args,
@@ -351,9 +358,14 @@ function sendJson(res, status, body) {
   res.end(JSON.stringify(body));
 }
 
-async function readBody(req) {
+const LARGE_BODY = 200_000_000;
+async function readBody(req, limit = 1_000_000) {
   const chunks = [];
-  for await (const chunk of req) chunks.push(chunk);
+  let size = 0;
+  for await (const chunk of req) {
+    if ((size += chunk.length) > limit) throw Object.assign(new Error("Request body too large"), { status: 413 });
+    chunks.push(chunk);
+  }
   const text = Buffer.concat(chunks).toString("utf8");
   return text ? JSON.parse(text) : {};
 }
@@ -415,7 +427,8 @@ const server = createServer(async (req, res) => {
     }
     if (url.pathname === "/api/call" && req.method === "POST") {
       if (client?.state !== "ready") return sendJson(res, 503, { error: "REA is not ready" });
-      const { name, arguments: args, target } = await readBody(req);
+      // Tool arguments can carry whole evidence records (e.g. a file inventory), so allow large bodies here.
+      const { name, arguments: args, target } = await readBody(req, LARGE_BODY);
       if (!tools.some((t) => t.name === name)) return sendJson(res, 404, { error: `Unknown tool ${name}` });
       return sendJson(res, 202, { callId: startCall(name, args ?? {}, { target: typeof target === "string" ? target : undefined }) });
     }
@@ -429,6 +442,24 @@ const server = createServer(async (req, res) => {
       }
       const { cancel, ...body } = record;
       return sendJson(res, 200, body);
+    }
+    // ---------- Saved analyses ----------
+    if (url.pathname === "/api/analyses" && req.method === "GET") return sendJson(res, 200, { analyses: await analyses.list() });
+    const analysisMatch = url.pathname.match(/^\/api\/analyses\/([^/]+)$/);
+    if (analysisMatch) {
+      const id = analysisMatch[1];
+      if (!AnalysisStore.validId(id)) return sendJson(res, 400, { error: "Invalid analysis id" });
+      if (req.method === "GET") {
+        const snapshot = await analyses.get(id);
+        return snapshot ? sendJson(res, 200, snapshot) : sendJson(res, 404, { error: "Analysis not found" });
+      }
+      if (req.method === "PUT") {
+        // Full REA results can be large (JavaScript analyses especially).
+        const snapshot = await readBody(req, LARGE_BODY);
+        if (snapshot.id !== id || typeof snapshot.path !== "string" || !Array.isArray(snapshot.steps)) return sendJson(res, 400, { error: "Invalid analysis" });
+        return sendJson(res, 200, await analyses.save(snapshot));
+      }
+      if (req.method === "DELETE") return sendJson(res, (await analyses.remove(id)) ? 200 : 404, { ok: true });
     }
     // ---------- Chat agent API ----------
     if (url.pathname === "/api/chat/config" && req.method === "GET") {
@@ -511,7 +542,7 @@ const server = createServer(async (req, res) => {
 
     sendJson(res, 404, { error: "Not found" });
   } catch (err) {
-    sendJson(res, 500, { error: err.message });
+    sendJson(res, err.status ?? 500, { error: err.message });
   }
 });
 

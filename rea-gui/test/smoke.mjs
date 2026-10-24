@@ -2,13 +2,15 @@
 import { spawn } from "node:child_process";
 import { fileURLToPath } from "node:url";
 import assert from "node:assert/strict";
+import { tmpdir } from "node:os";
+import { join } from "node:path";
 import { request } from "node:http";
 
 const port = 4599;
 const bin = fileURLToPath(new URL("../bin/rea-gui.mjs", import.meta.url));
 const fake = fileURLToPath(new URL("./fake-mcp.mjs", import.meta.url));
 const child = spawn(process.execPath, [bin, "--port", String(port), "--no-open"], {
-  env: { ...process.env, REA_BIN: fake, REA_NODE: process.execPath },
+  env: { ...process.env, REA_BIN: fake, REA_NODE: process.execPath, REA_GUI_DATA_DIR: join(tmpdir(), `rea-gui-smoke-${process.pid}`) },
   stdio: ["ignore", "pipe", "inherit"],
 });
 const base = `http://127.0.0.1:${port}`;
@@ -77,6 +79,9 @@ try {
   assert.equal((await api(`/api/calls/${slow.callId}`)).body.state, "error", "cancel");
 
   assert.equal((await api("/api/call", { method: "POST", body: JSON.stringify({ name: "nope" }) })).status, 404);
+  // Tool arguments can carry whole evidence records; a multi-megabyte call must go through.
+  const big = await api("/api/call", { method: "POST", body: JSON.stringify({ name: "inspect_desktop_application", arguments: { path: "/x", blob: "x".repeat(3_000_000) } }) });
+  assert.equal(big.status, 202, "large tool call accepted");
   assert.ok(Array.isArray((await api("/api/apps")).body.apps));
   assert.ok((await api("/api/fs?path=/")).body.items.length > 0);
   const binary = (await api(`/api/detect?path=${encodeURIComponent(process.execPath)}`)).body;

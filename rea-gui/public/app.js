@@ -1,6 +1,6 @@
 // REA Studio frontend. All target-derived text is rendered with textContent, never innerHTML.
 import { isEvidence, renderEvidence, drillPanel, renderFacts } from "/evidence.js";
-import { classify, KINDS, runAnalysis } from "/analyze.js";
+import { classify, KINDS, runAnalysis, restoreAnalysis } from "/analyze.js";
 const token = document.querySelector('meta[name="rea-gui-token"]').content;
 const $ = (sel) => document.querySelector(sel);
 const main = $("#main");
@@ -16,7 +16,8 @@ const state = {
   autoRun: false,
   session: null,
   hideUnavailable: localStorage.getItem("rea-gui-hide-unavailable") === "1",
-  analyses: JSON.parse(localStorage.getItem("rea-gui-analyses") ?? "[]"),
+  // Saved analyses come from the server; entries with a live `page` were opened in this tab.
+  analyses: [],
 };
 const waiters = new Map();
 // Evidence produced in this session, newest first: { id, label }.
@@ -114,6 +115,10 @@ function appendLog(line) {
   logEl.scrollTop = logEl.scrollHeight;
 }
 
+// Resolves once REA's status (with the current run's ID) and, if REA is up, its tools are known.
+let statusKnown;
+const statusReady = new Promise((resolve) => (statusKnown = resolve));
+
 function connectEvents() {
   const events = new EventSource(`/api/events?token=${token}`);
   events.addEventListener("status", async (e) => {
@@ -123,6 +128,7 @@ function connectEvents() {
     if (state.status.state === "ready" && (previous !== "ready" || state.tools.length === 0)) {
       await loadTools();
     }
+    if (state.status.state !== "starting") statusKnown();
   });
   events.addEventListener("stderr", (e) => appendLog(JSON.parse(e.data)));
   events.addEventListener("log", (e) => {
@@ -504,7 +510,10 @@ const analysisDeps = {
   toolExists,
   availabilityOf,
   iconUrl,
-  onChange: () => saveAnalyses(),
+  onChange: (analysis) => saveAnalysis(analysis),
+  rerun: (path) => analyzePath(path),
+  remove: (analysis) => removeAnalysis(analysis),
+  reaSession: () => state.status?.reaSession ?? null,
 };
 
 // ---------- per-app chat ----------
@@ -824,8 +833,8 @@ function startAnalysis(detected, kind) {
   if (active) return (location.hash = `#/analysis/${active.id}`);
   const analysis = runAnalysis(analysisDeps, detected, kind);
   withAnalysisChat(analysis);
-  state.analyses = [analysis, ...state.analyses.filter((a) => a.path !== detected.path)];
-  saveAnalyses();
+  state.analyses = [analysis, ...state.analyses.filter((a) => a !== analysis && a.path !== detected.path)];
+  renderAnalysisList();
   location.hash = `#/analysis/${analysis.id}`;
 }
 
@@ -836,17 +845,58 @@ async function analyzePath(path) {
   return { detected, kind };
 }
 
-function saveAnalyses() {
-  state.analyses = state.analyses.slice(0, 20);
-  localStorage.setItem("rea-gui-analyses", JSON.stringify(state.analyses.map(({ page, ...rest }) => rest)));
+// Writes for one analysis go out in order, and a newer snapshot replaces one still waiting.
+const analysisWrites = new Map(); // id → { running: Promise, next: snapshot | null }
+function saveAnalysis(analysis) {
+  state.analyses = [analysis, ...state.analyses.filter((a) => a !== analysis && a.path !== analysis.path)];
   renderAnalysisList();
+  const { page, waiting, results, saveError, ...snapshot } = analysis;
+  const slot = analysisWrites.get(analysis.id);
+  if (slot) return void (slot.next = snapshot);
+  const write = async (body) => {
+    try {
+      await api(`/api/analyses/${analysis.id}`, { method: "PUT", body });
+      analysis.saveError = null;
+    } catch (err) {
+      analysis.saveError = err.message;
+      console.warn(`Couldn't save analysis ${analysis.id}: ${err.message}`);
+    }
+    const next = analysisWrites.get(analysis.id)?.next;
+    if (next) {
+      analysisWrites.get(analysis.id).next = null;
+      return write(next);
+    }
+    analysisWrites.delete(analysis.id);
+  };
+  analysisWrites.set(analysis.id, { next: null });
+  write(snapshot);
 }
+
+async function removeAnalysis(analysis) {
+  await api(`/api/analyses/${analysis.id}`, { method: "DELETE" }).catch(() => {});
+  state.analyses = state.analyses.filter((a) => a !== analysis);
+  renderAnalysisList();
+  if (location.hash === `#/analysis/${analysis.id}`) location.hash = "#/";
+}
+
+// Merge the server's list with analyses this tab is running, which may not be saved yet.
+const analysesLoaded = (async () => {
+  localStorage.removeItem("rea-gui-analyses"); // older builds kept only names here, never results
+  try {
+    const { analyses } = await api("/api/analyses");
+    const live = state.analyses.filter((a) => a.page);
+    state.analyses = [...live, ...analyses.filter((s) => !live.some((a) => a.id === s.id || a.path === s.path))];
+  } catch (err) {
+    console.warn(`Couldn't load saved analyses: ${err.message}`);
+  }
+  renderAnalysisList();
+})();
 
 function renderAnalysisList() {
   const list = $("#analysis-list");
   list.replaceChildren();
   if (!state.analyses.length) list.append(h("div", { class: "empty", text: "No analyses yet" }));
-  const icon = { running: "◌", done: "✓", stopped: "■" };
+  const icon = { running: "◌", done: "✓", stopped: "■", interrupted: "■" };
   for (const a of state.analyses) {
     list.append(
       h(
@@ -860,23 +910,43 @@ function renderAnalysisList() {
   }
 }
 
-function renderAnalysisPage(id) {
+async function renderAnalysisPage(id) {
+  await analysesLoaded;
   const analysis = state.analyses.find((a) => a.id === id);
-  if (!analysis) return renderHome();
+  if (!analysis) return renderMissingAnalysis();
   if (analysis.page) {
     if (analysis.page.classList.contains("chat-shell")) attachChat(analysis.page);
     return setMain(analysis.page);
   }
-  // Pages from an earlier session aren't kept; REA results live only as long as the server.
+  setMain(h("div", { class: "empty", text: `Opening ${analysis.name}…` }));
+  let saved;
+  try {
+    saved = await api(`/api/analyses/${id}`);
+  } catch (err) {
+    if (location.hash !== `#/analysis/${id}`) return;
+    return setMain(
+      h("h1", { text: analysis.name }),
+      h("div", { class: "card" }, h("p", { class: "error-text", text: `Couldn't open the saved results: ${err.message}` }), h("button", { class: "primary", text: "Run analysis again", onclick: () => analyzePath(analysis.path) })),
+    );
+  }
+  // Another click may have opened it meanwhile; keep one page per analysis.
+  const current = state.analyses.find((a) => a.id === id);
+  if (!current?.page) {
+    // Drill-downs need REA's tool list and depend on its run ID; don't guess before both are known.
+    await Promise.race([statusReady, new Promise((r) => setTimeout(r, 3000))]);
+    if (state.analyses.find((a) => a.id === id)?.page) return location.hash === `#/analysis/${id}` && setMain(state.analyses.find((a) => a.id === id).page);
+    const restored = restoreAnalysis(analysisDeps, saved);
+    withAnalysisChat(restored);
+    state.analyses = state.analyses.map((a) => (a.id === id ? restored : a));
+    renderAnalysisList();
+  }
+  if (location.hash === `#/analysis/${id}`) setMain(state.analyses.find((a) => a.id === id).page);
+}
+
+function renderMissingAnalysis() {
   setMain(
-    h("h1", { text: analysis.name }),
-    h("p", { class: "muted" }, h("span", { class: "badge accent", text: KINDS[analysis.kind]?.label ?? analysis.kind }), " ", analysis.path),
-    h(
-      "div",
-      { class: "card" },
-      h("p", { text: "This analysis ran in an earlier session, and its results weren't kept." }),
-      h("button", { class: "primary", text: "Run analysis again", onclick: () => analyzePath(analysis.path) }),
-    ),
+    h("h1", { text: "Analysis not found" }),
+    h("div", { class: "card" }, h("p", { text: "It may have been removed, or replaced by a newer analysis of the same app." }), h("button", { class: "primary", text: "Start a new analysis", onclick: () => (location.hash = "#/") })),
   );
 }
 

@@ -354,54 +354,135 @@ export function recipeFor(kind) {
   return (RECIPES[kind] ?? []).map((id) => steps[id]);
 }
 
-// ---------- analysis page ----------
-// deps: { h, api, startCall, cancelCall, renderResult, evidenceCtx, toolExists, availabilityOf, iconUrl, onChange }
-export function runAnalysis(deps, detected, kind) {
-  const { h } = deps;
-  const info = KINDS[kind];
-  const recipe = recipeFor(kind);
-  const analysis = { id: `a${Date.now().toString(36)}`, path: detected.path, name: fileName(detected.path).replace(/\.app$/, ""), kind, at: Date.now(), state: "running", page: null, results: [] };
-  let stopped = false;
-  analysis.waiting = busy();
-  let currentCall = null;
+// Short type marks for the header when there's no app icon.
+const MARKS = { electron: "APP", "mac-app": "APP", android: "APK", ios: "IPA", js: "JS", windows: "EXE", "mach-o": "BIN", elf: "ELF", wasm: "WASM", sqlite: "DB", archive: "ZIP" };
+const when = (ms) => new Date(ms).toLocaleString(undefined, { dateStyle: "medium", timeStyle: "short" });
 
-  const glance = h("div", { class: "glance" });
-  const highlights = h("div", { class: "worth" });
-  const stopButton = h("button", {
-    class: "ghost danger",
-    text: "Stop analysis",
-    onclick: () => {
-      stopped = true;
-      if (currentCall) deps.cancelCall(currentCall);
-    },
-  });
+// ---------- analysis page ----------
+// deps: { h, api, startCall, cancelCall, renderResult, evidenceCtx, toolExists, availabilityOf, iconUrl, onChange, rerun, remove, reaSession }
+//
+// Each check ends as one saved step: { id, status: "done" | "failed" | "skipped" | "locked", record?, message?, availability? }.
+// A live run and a reopened analysis render through the same code, so a saved page matches the original.
+function analysisView(deps, analysis, detected) {
+  const { h } = deps;
+  const info = KINDS[analysis.kind];
+  const mark = () => h("div", { class: "kind-icon big", text: MARKS[analysis.kind] ?? "?" });
+  const actions = h("div", { class: "analysis-actions" });
+  const meta = h("span", { class: "muted small analysis-meta" });
   const header = h(
     "div",
     { class: "analysis-head" },
-    detected.path.endsWith(".app") ? h("img", { class: "app-icon big", alt: "", src: deps.iconUrl(detected.path), onerror: (e) => e.target.replaceWith(h("div", { class: "kind-icon big", text: info.icon })) }) : h("div", { class: "kind-icon big", text: info.icon }),
-    h("div", { class: "grow" }, h("h1", { text: analysis.name }), h("div", { class: "muted" }, h("span", { class: "badge accent", text: info.label }), " ", h("span", { class: "path", text: detected.path }))),
-    stopButton,
+    detected.path.endsWith(".app") ? h("img", { class: "app-icon big", alt: "", src: deps.iconUrl(detected.path), onerror: (e) => e.target.replaceWith(mark()) }) : mark(),
+    h("div", { class: "grow" }, h("h1", { text: analysis.name }), h("div", { class: "muted" }, h("span", { class: "badge accent", text: info.label }), " ", h("span", { class: "path", text: detected.path })), meta),
+    actions,
   );
-  const cards = recipe.map((step) => stepCard(deps, step));
-  const tiles = cards.map((card) => {
-    const tile = h("button", { class: "glance-tile waiting", onclick: () => card.el.scrollIntoView({ behavior: "smooth", block: "start" }) }, h("div", { class: "glance-label", text: card.step.title }), h("div", { class: "glance-value", text: "Waiting" }));
-    card.onState = (cls, text) => {
-      tile.className = `glance-tile ${cls}`;
-      tile.lastChild.textContent = text;
-    };
-    return tile;
-  });
-  glance.append(...tiles);
-  analysis.page = h(
-    "div",
-    { class: "analysis" },
-    header,
-    h("p", { class: "lede", text: info.blurb }),
-    h("div", { class: "card overview" }, h("div", { class: "card-title", text: "At a glance" }), glance, highlights),
-    ...cards.map((c) => c.el),
+  const glance = h("div", { class: "glance" });
+  const highlights = h("div", { class: "worth" });
+  const cards = recipeFor(analysis.kind).map((step) => stepCard(deps, step));
+  glance.append(
+    ...cards.map((card) => {
+      const tile = h("button", { class: "glance-tile waiting", onclick: () => card.el.scrollIntoView({ behavior: "smooth", block: "start" }) }, h("div", { class: "glance-label", text: card.step.title }), h("div", { class: "glance-value", text: "Waiting" }));
+      card.onState = (cls, text) => {
+        tile.className = `glance-tile ${cls}`;
+        tile.lastChild.textContent = text;
+      };
+      return tile;
+    }),
+  );
+  analysis.page = h("div", { class: "analysis" }, header, h("p", { class: "lede", text: info.blurb }), h("div", { class: "card overview" }, h("div", { class: "card-title", text: "At a glance" }), glance, highlights), ...cards.map((c) => c.el));
+
+  const findings = [];
+  // Drill-downs read evidence REA keeps in memory; after a restart those IDs no longer resolve.
+  const stale = () => Boolean(analysis.reaSession) && analysis.reaSession !== deps.reaSession();
+  const view = {
+    cards,
+    // Show a finished step on its card and fold it into the overview and the chat context.
+    apply(card, entry) {
+      if (entry.status === "skipped") return card.skip(entry.message);
+      if (entry.status === "locked") return card.locked(entry.availability);
+      if (entry.status === "failed") return card.fail(entry.message, entry.record ?? null);
+      const parsed = parse(entry.record);
+      let summary;
+      try {
+        summary = card.step.summarize(parsed, entry.record);
+      } catch {
+        summary = { headline: "Done", facts: [], findings: [] };
+      }
+      card.done(summary, entry.record, parsed, { stale: stale() });
+      analysis.results.push({ check: card.step.title, headline: summary.headline, facts: summary.facts.filter(([, v]) => v != null && v !== ""), findings: summary.findings.map(([tone, text]) => `${tone}: ${text}`) });
+      for (const f of summary.findings) findings.push({ tone: f[0], text: f[1], step: card.step.title });
+      if (summary.findings.some(([tone]) => tone === "warn")) card.onState?.("done warn", summary.headline || "Done");
+      view.highlights();
+    },
+    // Only the points worth a closer look; everything else lives in each check's card.
+    highlights(final = false) {
+      const warns = findings.filter((f) => f.tone === "warn");
+      if (!warns.length) {
+        highlights.replaceChildren(final ? h("p", { class: "muted small", text: "Nothing stood out. Each check's details are below." }) : "");
+        return;
+      }
+      const LIMIT = 5;
+      const list = h("ul", { class: "findings" }, ...warns.slice(0, LIMIT).map((f) => findingItem(h, [f.tone, f.text], f.step)));
+      const more =
+        warns.length > LIMIT
+          ? h("button", {
+              class: "link",
+              text: `Show ${warns.length - LIMIT} more findings`,
+              onclick: (e) => (list.replaceChildren(...warns.map((f) => findingItem(h, [f.tone, f.text], f.step))), e.target.remove()),
+            })
+          : null;
+      highlights.replaceChildren(...[h("div", { class: "section-label", text: `Worth a look (${warns.length})` }), list, more].filter(Boolean));
+    },
+    // Header for a finished (or interrupted) analysis: when it ran, and what you can do with it.
+    finish() {
+      view.highlights(true);
+      // "interrupted": saved mid-run, then the tab closed or reloaded (or another tab is still running it).
+      const label = { done: "Analyzed", stopped: "Stopped", interrupted: "Didn't finish; last saved" }[analysis.state] ?? "Analyzed";
+      meta.textContent = `${label} ${when(analysis.finishedAt ?? analysis.at)}`;
+      actions.replaceChildren(
+        h("button", { class: "ghost", text: "Remove", title: "Delete this saved analysis", onclick: () => confirm(`Remove the saved analysis of ${analysis.name}?`) && deps.remove(analysis) }),
+        h("button", { class: "primary", text: "Run again", onclick: () => deps.rerun(analysis.path) }),
+      );
+    },
+    actions,
+    meta,
+  };
+  return view;
+}
+
+export function runAnalysis(deps, detected, kind) {
+  const { h } = deps;
+  const analysis = {
+    id: `a${Date.now().toString(36)}`,
+    path: detected.path,
+    name: fileName(detected.path).replace(/\.app$/, ""),
+    kind,
+    detected,
+    at: Date.now(),
+    finishedAt: null,
+    state: "running",
+    reaSession: deps.reaSession(),
+    steps: [],
+    results: [],
+    page: null,
+  };
+  const view = analysisView(deps, analysis, detected);
+  const { cards } = view;
+  let stopped = false;
+  analysis.waiting = busy();
+  let currentCall = null;
+  view.meta.textContent = `Started ${when(analysis.at)}`;
+  view.actions.append(
+    h("button", {
+      class: "ghost danger",
+      text: "Stop analysis",
+      onclick: () => {
+        stopped = true;
+        if (currentCall) deps.cancelCall(currentCall);
+      },
+    }),
   );
 
-  const allFindings = [];
   const ctx = {
     h,
     kind,
@@ -429,93 +510,79 @@ export function runAnalysis(deps, detected, kind) {
     },
   };
 
+  // Decide how one check ends; the caller records and shows the outcome.
+  async function check(card) {
+    const skipped = (message) => ({ id: card.step.id, status: "skipped", message });
+    if (stopped) return skipped("Stopped");
+    const missing = card.step.tools.find((t) => !deps.toolExists(t));
+    if (missing) return skipped(`This REA version has no ${missing} tool.`);
+    // Other reasons describe whatever target happens to be open; this flow opens its own.
+    const blocked = card.step.tools.map((t) => deps.availabilityOf(t)).find((a) => a?.available === false && a.reason in REASONS);
+    if (blocked) return { id: card.step.id, status: "locked", availability: blocked };
+    card.start();
+    ctx.progress = (text) => card.progress(text);
+    let record;
+    try {
+      record = keep(await card.step.run(ctx));
+    } catch (err) {
+      return stopped ? skipped("Stopped before this check started.") : { id: card.step.id, status: "failed", message: err.message };
+    }
+    if (stopped) return skipped("Stopped before this check finished.");
+    const parsed = parse(record);
+    if (record.state !== "done" || record.result?.isError || !parsed) return { id: card.step.id, status: "failed", message: failureMessage(record, parsed), record };
+    return { id: card.step.id, status: "done", record };
+  }
+
   // REA has one active target, so analyses run one at a time.
   const previous = queue;
   let release;
   queue = new Promise((resolve) => (release = resolve));
   (async () => {
     running++;
+    deps.onChange(analysis);
     if (analysis.waiting) {
       cards[0]?.queued();
       await previous;
     }
-    for (const card of cards) {
-      if (stopped) {
-        card.skip("Stopped");
-        continue;
+    try {
+      for (const card of cards) {
+        const entry = await check(card);
+        analysis.steps.push(entry);
+        view.apply(card, entry);
+        // Save after every check, so closing the tab mid-run keeps what already finished.
+        deps.onChange(analysis);
       }
-      const missing = card.step.tools.find((t) => !deps.toolExists(t));
-      // Other reasons describe whatever target happens to be open; this flow opens its own.
-      const blocked = card.step.tools.map((t) => deps.availabilityOf(t)).find((a) => a?.available === false && a.reason in REASONS);
-      if (missing) {
-        card.skip(`This REA version has no ${missing} tool.`);
-        continue;
-      }
-      if (blocked) {
-        card.locked(blocked);
-        continue;
-      }
-      card.start();
-      ctx.progress = (text) => card.progress(text);
-      let record;
-      try {
-        record = await card.step.run(ctx);
-      } catch (err) {
-        if (stopped) card.skip("Stopped before this check started.");
-        else card.fail(err.message, null);
-        continue;
-      }
-      const parsed = parse(record);
-      if (stopped) {
-        card.skip("Stopped before this check finished.");
-        continue;
-      }
-      if (record.state !== "done" || record.result?.isError || !parsed) {
-        card.fail(failureMessage(record, parsed), record);
-        continue;
-      }
-      let summary;
-      try {
-        summary = card.step.summarize(parsed, record);
-      } catch {
-        summary = { headline: "Done", facts: [], findings: [] };
-      }
-      card.done(summary, record, parsed);
-      // Plain-text results, used as context for the analysis chat.
-      analysis.results.push({ check: card.step.title, headline: summary.headline, facts: summary.facts.filter(([, v]) => v != null && v !== ""), findings: summary.findings.map(([tone, text]) => `${tone}: ${text}`) });
-      for (const f of summary.findings) allFindings.push({ tone: f[0], text: f[1], step: card.step.title });
-      if (summary.findings.some(([tone]) => tone === "warn")) card.onState?.("done warn", summary.headline || "Done");
-      renderHighlights();
+    } finally {
+      running--;
+      release();
     }
-    running--;
-    release();
     analysis.state = stopped ? "stopped" : "done";
-    stopButton.remove();
-    renderHighlights(true);
+    analysis.finishedAt = Date.now();
+    view.finish();
     deps.onChange(analysis);
   })();
 
-  // Only the points worth a closer look; everything else lives in each check's card.
-  function renderHighlights(final = false) {
-    const warns = allFindings.filter((f) => f.tone === "warn");
-    if (!warns.length) {
-      highlights.replaceChildren(final ? h("p", { class: "muted small", text: "Nothing stood out. Each check's details are below." }) : "");
-      return;
-    }
-    const LIMIT = 5;
-    const list = h("ul", { class: "findings" }, ...warns.slice(0, LIMIT).map((f) => findingItem(h, [f.tone, f.text], f.step)));
-    const more =
-      warns.length > LIMIT
-        ? h("button", {
-            class: "link",
-            text: `Show ${warns.length - LIMIT} more findings`,
-            onclick: (e) => (list.replaceChildren(...warns.map((f) => findingItem(h, [f.tone, f.text], f.step))), e.target.remove()),
-          })
-        : null;
-    highlights.replaceChildren(...[h("div", { class: "section-label", text: `Worth a look (${warns.length})` }), list, more].filter(Boolean));
-  }
-
   return analysis;
+}
+
+// Rebuild a saved analysis without calling REA again.
+export function restoreAnalysis(deps, saved) {
+  const analysis = { ...saved, state: saved.state === "running" ? "interrupted" : saved.state, results: [], page: null };
+  const view = analysisView(deps, analysis, saved.detected ?? { path: saved.path });
+  for (const card of view.cards) {
+    const entry = saved.steps.find((e) => e.id === card.step.id);
+    if (entry) view.apply(card, entry);
+    else card.skip(analysis.state === "interrupted" ? "Didn't run: the analysis hadn't reached this check when it was last saved." : "Didn't run.");
+  }
+  view.finish();
+  return analysis;
+}
+
+// The parts of a call record the page needs; progress and routing details aren't worth saving.
+function keep(record) {
+  if (!record) return record;
+  const { name, arguments: args, state, result, error, startedAt, finishedAt, inventory } = record;
+  return { name, arguments: args, state, result, error, startedAt, finishedAt, ...(inventory ? { inventory } : {}) };
 }
 
 function stepCard(deps, step) {
@@ -555,12 +622,17 @@ function stepCard(deps, step) {
     progress(text) {
       if (this.progressEl && text) this.progressEl.textContent = text;
     },
-    done(summary, record, parsed) {
+    done(summary, record, parsed, { stale = false } = {}) {
       set("done", "✓", summary.headline || "Done");
       const facts = summary.facts.filter(([, v]) => v !== null && v !== undefined && v !== "");
       const drills = h("div", { class: "drills" });
-      const explore = summary.explore ? exploreFor(deps.evidenceCtx(drills), parsed) : null;
-      if (explore) explore.querySelector(".section-label")?.replaceChildren("Look closer");
+      let explore = null;
+      if (summary.explore && stale) {
+        explore = h("p", { class: "muted small", text: "Drill-downs read data REA keeps only while it runs, and REA has restarted since this analysis. The results above and the full REA result are saved. Run the analysis again to explore further." });
+      } else if (summary.explore) {
+        explore = exploreFor(deps.evidenceCtx(drills), parsed);
+        explore?.querySelector(".section-label")?.replaceChildren("Look closer");
+      }
       // Short values read best as tiles; identifiers, dates and hashes as a key/value list.
       const tiles = facts.filter(([, v]) => String(n(v)).length <= 14);
       const rows = facts.filter(([, v]) => String(n(v)).length > 14);

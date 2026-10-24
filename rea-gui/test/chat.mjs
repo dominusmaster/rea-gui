@@ -3,6 +3,8 @@ import { spawn } from "node:child_process";
 import { createServer } from "node:http";
 import { fileURLToPath } from "node:url";
 import assert from "node:assert/strict";
+import { tmpdir } from "node:os";
+import { join } from "node:path";
 
 const port = 4598;
 const bin = fileURLToPath(new URL("../bin/rea-gui.mjs", import.meta.url));
@@ -45,7 +47,7 @@ const anthropic = createServer(async (req, res) => {
 await new Promise((r) => anthropic.listen(0, "127.0.0.1", r));
 
 const child = spawn(process.execPath, [bin, "--port", String(port), "--no-open"], {
-  env: { ...process.env, REA_BIN: fake, REA_NODE: process.execPath, ANTHROPIC_BASE_URL: `http://127.0.0.1:${anthropic.address().port}`, ANTHROPIC_API_KEY: "" },
+  env: { ...process.env, REA_BIN: fake, REA_NODE: process.execPath, ANTHROPIC_BASE_URL: `http://127.0.0.1:${anthropic.address().port}`, ANTHROPIC_API_KEY: "", REA_GUI_DATA_DIR: join(tmpdir(), `rea-gui-chat-${process.pid}`) },
   stdio: ["ignore", "pipe", "inherit"],
 });
 const base = `http://127.0.0.1:${port}`;

@@ -501,8 +501,11 @@ table.data tr.detail-row .tree { max-height: 40vh; }
 .analysis-head { display: flex; gap: 16px; align-items: center; }
 .analysis-head h1 { margin: 0 0 4px; }
 .analysis-head .path { font-family: var(--mono); font-size: 12px; color: var(--muted-foreground); word-break: break-all; }
+.analysis-meta { display: block; margin-top: 4px; }
+.analysis-actions { display: flex; gap: 8px; flex-shrink: 0; }
+.analysis-actions:empty { display: none; }
 .kind-icon { display: grid; place-items: center; background: var(--muted); border-radius: var(--radius); font-weight: 600; color: var(--foreground); }
-.kind-icon.big { width: 56px; height: 56px; font-size: 22px; flex-shrink: 0; }
+.kind-icon.big { width: 56px; height: 56px; font-size: 13px; letter-spacing: 0.02em; flex-shrink: 0; }
 .glance { display: grid; grid-template-columns: repeat(auto-fill, minmax(210px, 1fr)); gap: 8px; }
 .glance-tile {
   display: grid;
