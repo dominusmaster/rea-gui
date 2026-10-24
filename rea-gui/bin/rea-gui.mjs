@@ -11,7 +11,8 @@ import { fileURLToPath } from "node:url";
 import { McpStdioClient } from "../lib/mcp-client.mjs";
 import { AnalysisStore } from "../lib/analyses.mjs";
 import { TargetBroker } from "../lib/target.mjs";
-import { AgentSession, MODELS, EFFORTS, DEFAULT_EFFORT, publicAgents } from "../lib/agent.mjs";
+import { AnthropicSession, MODELS, EFFORTS, DEFAULT_EFFORT, PROVIDERS, publicAgents } from "../lib/agent.mjs";
+import { OpenRouterSession, listOpenRouterModels } from "../lib/openrouter.mjs";
 
 const here = dirname(fileURLToPath(import.meta.url));
 const publicDir = resolve(here, "..", "public");
@@ -32,7 +33,8 @@ Usage: rea-gui [--port N] [--host 127.0.0.1] [--no-open]
 Environment:
   REA_BIN    Path to REA's scripts/rea.mjs or a rea executable
   REA_NODE   Node.js binary used to run REA (must satisfy REA's engines)
-  REA_GUI_DATA_DIR  Where saved analyses live (default ~/.rea-gui)`);
+  REA_GUI_DATA_DIR  Where saved analyses live (default ~/.rea-gui)
+  ANTHROPIC_API_KEY, OPENROUTER_API_KEY  Chat keys, instead of entering them in the browser`);
   process.exit(0);
 }
 if (flag("version")) {
@@ -121,7 +123,7 @@ let chatSeq = 0;
 
 function chatSummary(id, chat) {
   const s = chat.session;
-  return { id, agent: s.agent, model: s.model, title: s.title, busy: s.busy, createdAt: chat.createdAt, scope: chat.scope ?? null };
+  return { id, provider: s.provider, agent: s.agent, model: s.model, title: s.title, busy: s.busy, createdAt: chat.createdAt, scope: chat.scope ?? null };
 }
 
 // Coalesce streamed text so a reconnecting browser replays whole blocks, not every delta.
@@ -353,6 +355,11 @@ const token = randomBytes(24).toString("hex");
 const allowedHosts = new Set([`${host}:${port}`, `localhost:${port}`, `127.0.0.1:${port}`]);
 const mime = { ".html": "text/html", ".js": "text/javascript", ".css": "text/css", ".svg": "image/svg+xml" };
 
+function serverKey(provider) {
+  if (provider === "openrouter") return Boolean(process.env.OPENROUTER_API_KEY);
+  return Boolean(process.env.ANTHROPIC_API_KEY || process.env.ANTHROPIC_AUTH_TOKEN);
+}
+
 function sendJson(res, status, body) {
   res.writeHead(status, { "content-type": "application/json", "cache-control": "no-store" });
   res.end(JSON.stringify(body));
@@ -465,26 +472,45 @@ const server = createServer(async (req, res) => {
     if (url.pathname === "/api/chat/config" && req.method === "GET") {
       return sendJson(res, 200, {
         agents: publicAgents(),
-        models: MODELS,
+        providers: PROVIDERS.map((p) => ({ ...p, serverKey: serverKey(p.id) })),
+        models: MODELS, // Anthropic's; OpenRouter's come from /api/chat/models
         efforts: EFFORTS,
         defaultEffort: DEFAULT_EFFORT,
-        serverKey: Boolean(process.env.ANTHROPIC_API_KEY || process.env.ANTHROPIC_AUTH_TOKEN),
+        serverKey: serverKey("anthropic"),
       });
+    }
+    // OpenRouter's catalog changes often, so the browser asks for it (with its key) instead of a fixed list.
+    if (url.pathname === "/api/chat/models" && req.method === "POST") {
+      const { provider, apiKey, refresh } = await readBody(req);
+      if (provider !== "openrouter") return sendJson(res, 200, { models: MODELS });
+      try {
+        return sendJson(res, 200, { models: await listOpenRouterModels(apiKey || process.env.OPENROUTER_API_KEY, { refresh: Boolean(refresh) }) });
+      } catch (err) {
+        return sendJson(res, 502, { error: `Couldn't load OpenRouter models: ${err.message}` });
+      }
     }
     if (url.pathname === "/api/chat/sessions" && req.method === "GET") {
       return sendJson(res, 200, { sessions: [...chats].map(([id, chat]) => chatSummary(id, chat)).reverse() });
     }
     if (url.pathname === "/api/chat/sessions" && req.method === "POST") {
-      const { apiKey, model, agent, context, scope } = await readBody(req);
-      if (!apiKey && !process.env.ANTHROPIC_API_KEY && !process.env.ANTHROPIC_AUTH_TOKEN) {
-        return sendJson(res, 400, { error: "An Anthropic API key is required" });
+      const { apiKey, model, agent, context, scope, provider: providerId = "anthropic" } = await readBody(req);
+      const provider = PROVIDERS.find((p) => p.id === providerId);
+      if (!provider) return sendJson(res, 400, { error: `Unknown provider ${providerId}` });
+      if (!apiKey && !serverKey(provider.id)) return sendJson(res, 400, { error: `An ${provider.keyLabel} is required` });
+      let modelInfo = null;
+      if (provider.id === "openrouter") {
+        if (typeof model !== "string" || !model) return sendJson(res, 400, { error: "Pick an OpenRouter model" });
+        // Model details decide whether to ask for reasoning; chatting still works if the catalog is unreachable.
+        modelInfo = (await listOpenRouterModels(apiKey || process.env.OPENROUTER_API_KEY).catch(() => [])).find((m) => m.id === model) ?? null;
       }
       const id = `chat-${bootId}-${++chatSeq}`;
       // A scoped chat (e.g. one analysis) carries fixed context; cap it so a page can't bloat every request.
       const chat = { log: [], streams: new Set(), createdAt: Date.now(), scope: typeof scope === "string" ? scope.slice(0, 2048) : null };
-      chat.session = new AgentSession({
+      const Session = provider.id === "openrouter" ? OpenRouterSession : AnthropicSession;
+      chat.session = new Session({
         apiKey: apiKey || undefined,
         model,
+        modelInfo,
         agent,
         context: typeof context === "string" ? context.slice(0, 20000) : undefined,
         getMcpClient: () => client,

@@ -625,6 +625,8 @@ dialog::backdrop { background: rgb(0 0 0 / 0.5); }
 .chat-settings { display: grid; grid-template-columns: repeat(auto-fit, minmax(220px, 1fr)); gap: 16px; margin-top: 16px; padding: 16px; border: 1px solid var(--border); border-radius: calc(var(--radius) + 4px); box-shadow: var(--shadow-sm); }
 .chat-field { display: flex; flex-direction: column; gap: 6px; font-size: 14px; font-weight: 500; }
 .chat-field small { font-weight: 400; font-size: 12px; }
+.chat-field a { color: inherit; text-decoration: underline; text-underline-offset: 2px; }
+.chat-field small .link { font-size: 12px; }
 .chat-label { display: flex; align-items: center; gap: 8px; font-size: 13px; color: var(--muted-foreground); }
 .chat-label select { width: auto; height: 32px; font-size: 13px; }
 .chat-body { flex: 1; overflow-y: auto; padding: 8px 4px 8px 0; min-height: 0; }

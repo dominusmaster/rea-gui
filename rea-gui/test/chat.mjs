@@ -46,8 +46,48 @@ const anthropic = createServer(async (req, res) => {
 });
 await new Promise((r) => anthropic.listen(0, "127.0.0.1", r));
 
+// ---------- fake OpenRouter (Chat Completions) ----------
+const orRequests = [];
+const chunk = (delta, finish = null) => ({ id: "gen-1", choices: [{ index: 0, delta, finish_reason: finish }] });
+function orStream(res, chunks) {
+  res.writeHead(200, { "content-type": "text/event-stream" });
+  res.write(": OPENROUTER PROCESSING\n\n");
+  for (const c of chunks) res.write(`data: ${JSON.stringify(c)}\n\n`);
+  res.end("data: [DONE]\n\n");
+}
+const openrouter = createServer(async (req, res) => {
+  if (req.url.startsWith("/models")) {
+    res.writeHead(200, { "content-type": "application/json" });
+    return res.end(
+      JSON.stringify({
+        data: [
+          { id: "acme/thinker", name: "Acme Thinker", context_length: 200000, pricing: { prompt: "0.000003", completion: "0.000015" }, supported_parameters: ["tools", "reasoning"], top_provider: { max_completion_tokens: 16000 } },
+          { id: "acme/no-tools", name: "Acme Plain", pricing: { prompt: "0", completion: "0" }, supported_parameters: ["temperature"] },
+        ],
+      }),
+    );
+  }
+  const chunks = [];
+  for await (const c of req) chunks.push(c);
+  const body = JSON.parse(Buffer.concat(chunks).toString());
+  orRequests.push({ body, auth: req.headers.authorization });
+  const last = body.messages.at(-1);
+  if (last.role === "user")
+    return orStream(res, [
+      chunk({ reasoning: "Need a tool. ", reasoning_details: [{ type: "reasoning.text", text: "Need a ", index: 0, format: "unknown" }] }),
+      chunk({ reasoning_details: [{ type: "reasoning.text", text: "tool. ", index: 0 }] }),
+      chunk({ content: "Searching. " }),
+      chunk({ tool_calls: [{ index: 0, id: "call_s", type: "function", function: { name: "search_tools", arguments: '{"query":' } }] }),
+      chunk({ tool_calls: [{ index: 0, function: { arguments: '"desktop app"}' } }] }, "tool_calls"),
+    ]);
+  if (body.messages.filter((m) => m.role === "tool").length === 1)
+    return orStream(res, [chunk({ tool_calls: [{ index: 0, id: "call_t", type: "function", function: { name: "inspect_desktop_application", arguments: '{"path":"/Applications/X.app"}' } }] }, "tool_calls")]);
+  orStream(res, [chunk({ content: `Tool said: ${last.content}` }), chunk({}, "stop")]);
+});
+await new Promise((r) => openrouter.listen(0, "127.0.0.1", r));
+
 const child = spawn(process.execPath, [bin, "--port", String(port), "--no-open"], {
-  env: { ...process.env, REA_BIN: fake, REA_NODE: process.execPath, ANTHROPIC_BASE_URL: `http://127.0.0.1:${anthropic.address().port}`, ANTHROPIC_API_KEY: "", REA_GUI_DATA_DIR: join(tmpdir(), `rea-gui-chat-${process.pid}`) },
+  env: { ...process.env, REA_BIN: fake, REA_NODE: process.execPath, ANTHROPIC_BASE_URL: `http://127.0.0.1:${anthropic.address().port}`, ANTHROPIC_API_KEY: "", OPENROUTER_API_KEY: "", OPENROUTER_BASE_URL: `http://127.0.0.1:${openrouter.address().port}`, REA_GUI_DATA_DIR: join(tmpdir(), `rea-gui-chat-${process.pid}`) },
   stdio: ["ignore", "pipe", "inherit"],
 });
 const base = `http://127.0.0.1:${port}`;
@@ -118,8 +158,54 @@ try {
   const system = JSON.stringify(requests[before].body.system);
   assert.match(system, /Path: \/Applications\/X\.app/, "scoped context reaches the system prompt");
   assert.ok((await api("/api/chat/sessions")).body.sessions.some((x) => x.scope === "analysis:a1"), "scope listed");
+
+  // ---------- OpenRouter ----------
+  const providers = (await api("/api/chat/config")).body.providers.map((p) => p.id);
+  assert.deepEqual(providers, ["anthropic", "openrouter"]);
+  const models = (await api("/api/chat/models", { method: "POST", body: JSON.stringify({ provider: "openrouter", apiKey: "sk-or-test" }) })).body.models;
+  assert.deepEqual(models.map((m) => m.id), ["acme/thinker"], "only tool-capable models are listed");
+  assert.match(models[0].note, /\$3\.00 in · \$15\.00 out/);
+  assert.equal((await api("/api/chat/sessions", { method: "POST", body: JSON.stringify({ provider: "openrouter", model: "acme/thinker" }) })).status, 400, "OpenRouter key required");
+  assert.equal((await api("/api/chat/sessions", { method: "POST", body: JSON.stringify({ provider: "openrouter", apiKey: "sk-or-test" }) })).status, 400, "model required");
+  const or = await api("/api/chat/sessions", { method: "POST", body: JSON.stringify({ provider: "openrouter", apiKey: "sk-or-test", model: "acme/thinker", agent: "rea-assistant" }) });
+  assert.equal(or.status, 201);
+  assert.equal(or.body.provider, "openrouter");
+  await api(`/api/chat/sessions/${or.body.id}/message`, { method: "POST", body: JSON.stringify({ message: "Inspect X", effort: "medium" }) });
+  let orLog;
+  for (let i = 0; i < 100; i++) {
+    await sleep(50);
+    const stream = await fetch(`${base}/api/chat/sessions/${or.body.id}/stream?token=${token}`);
+    const reader = stream.body.getReader();
+    const { value } = await reader.read();
+    reader.cancel();
+    orLog = JSON.parse(new TextDecoder().decode(value).match(/event: reset\ndata: (.*)\n/)[1]);
+    if (orLog.events.some((e) => e.type === "turn_end")) break;
+  }
+  const orTypes = orLog.events.map((e) => e.type);
+  assert.ok(!orTypes.includes("error"), `no errors: ${JSON.stringify(orLog.events.filter((e) => e.type === "error"))}`);
+  assert.equal(orLog.events.find((e) => e.type === "thinking").text, "Need a tool. ", "reasoning streams to the browser");
+  assert.deepEqual(orLog.events.find((e) => e.type === "tool_search_result").tools, ["inspect_desktop_application"]);
+  assert.deepEqual(orTypes.filter((t) => t.startsWith("tool_") && t !== "tool_search_query"), ["tool_search", "tool_search_result", "tool_start", "tool_end"]);
+  assert.match(orLog.events.filter((e) => e.type === "text").at(-1).text, /Tool said: .*X\.app/, "tool result reached the model");
+
+  assert.equal(orRequests.length, 3);
+  const [r1, r2] = orRequests;
+  assert.equal(r1.auth, "Bearer sk-or-test");
+  assert.equal(r1.body.model, "acme/thinker");
+  assert.deepEqual(r1.body.reasoning, { effort: "medium" }, "reasoning requested for a reasoning model");
+  assert.equal(r1.body.max_tokens, 16000, "capped at the model's output limit");
+  assert.equal(r1.body.messages[0].role, "system");
+  const names = (r) => r.body.tools.map((t) => t.function.name);
+  assert.deepEqual(names(r1), ["search_tools", "open_binary", "binary_session", "inspect_signature"], "search plus available starters only");
+  assert.ok(names(r2).includes("inspect_desktop_application"), "found tools are sent on the next request");
+  const assistant = r2.body.messages.find((m) => m.role === "assistant");
+  assert.deepEqual(assistant.reasoning_details, [{ type: "reasoning.text", text: "Need a tool. ", index: 0, format: "unknown" }], "reasoning is passed back, joined");
+  assert.equal(assistant.tool_calls[0].function.arguments, '{"query":"desktop app"}', "streamed arguments are joined");
+  assert.equal(r2.body.messages.at(-1).role, "tool");
+  assert.equal(r2.body.messages.at(-1).tool_call_id, "call_s");
   console.log("chat test passed");
 } finally {
   child.kill();
   anthropic.close();
+  openrouter.close();
 }

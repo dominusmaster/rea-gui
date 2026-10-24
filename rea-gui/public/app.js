@@ -623,7 +623,7 @@ function appChat(key) {
       h(
         "div",
         { class: "analysis-chat-empty" },
-        h("p", { class: "muted", text: general ? "Open a file in REA, or ask about any app on this computer. Claude runs REA tools and asks before anything that changes state." : `Questions here stay on ${name}. The same chat follows you across this app's analysis and tool pages.` }),
+        h("p", { class: "muted", text: general ? "Open a file in REA, or ask about any app on this computer. The assistant runs REA tools and asks before anything that changes state." : `Questions here stay on ${name}. The same chat follows you across this app's analysis and tool pages.` }),
         h("div", { class: "chips" }, ...(SUGGESTIONS[kind] ?? SUGGESTIONS["mac-app"]).map((q) => h("button", { class: "ghost small", type: "button", text: q, onclick: () => ((prompt.value = q), submit()) }))),
       ),
     );
@@ -658,12 +658,14 @@ function appChat(key) {
   }
 
   const showKeyField = () => {
-    const input = h("input", { type: "password", placeholder: "sk-ant-…", autocomplete: "off", "aria-label": "Anthropic API key", value: chatState.apiKey });
-    input.addEventListener("change", () => {
-      chatState.apiKey = input.value.trim();
-      localStorage.setItem("rea-chat-apikey", chatState.apiKey);
-    });
-    keyRow.replaceChildren(h("label", { class: "field-label", text: "Anthropic API key" }), h("p", { class: "muted small", text: "Saved in this browser and shared with every chat." }), input);
+    const provider = chatProvider();
+    const input = h("input", { type: "password", placeholder: provider.keyPlaceholder, autocomplete: "off", "aria-label": provider.keyLabel, value: chatKey() });
+    input.addEventListener("change", () => setChatKey(input.value));
+    keyRow.replaceChildren(
+      h("label", { class: "field-label", text: provider.keyLabel }),
+      h("p", { class: "muted small" }, "Saved in this browser and shared with every chat. To switch provider or model, open ", h("a", { href: "#/chat", text: "Chat settings" }), "."),
+      input,
+    );
     keyRow.classList.remove("hidden");
     input.focus();
   };
@@ -682,15 +684,17 @@ function appChat(key) {
     status.classList.add("hidden");
     if (!chatState.config) await loadChatConfig();
     if (!chatState.config) return fail(`Chat isn't available: ${chatState.configError ?? "unknown error"}`);
-    if (!chatState.apiKey && !chatState.config.serverKey) {
+    if (!hasChatKey()) {
       showKeyField();
-      return fail("Add your Anthropic API key to ask questions.");
+      return fail(`Add your ${chatProvider().keyLabel} to ask questions.`);
     }
+    if (chatState.provider === "openrouter" && !chatState.orModel) await loadOpenRouterModels();
+    if (chatSetupProblem()) return fail(chatSetupProblem());
     try {
       if (!c.chatId) {
         // REA tools are needed here, so always use the REA assistant.
         const agent = chatState.config.agents.find((a) => a.usesRea)?.id ?? chatState.agent;
-        const sess = await api("/api/chat/sessions", { method: "POST", body: { apiKey: chatState.apiKey, model: chatState.model, agent, context: appChatContext(key), scope } });
+        const sess = await api("/api/chat/sessions", { method: "POST", body: newChatBody({ agent, context: appChatContext(key), scope }) });
         keyRow.classList.add("hidden");
         connect(sess.id);
       }
@@ -1726,12 +1730,17 @@ $("#restart").addEventListener("click", () => api("/api/restart", { method: "POS
 // ---------- Chat ----------
 // The server keeps each chat's event log; the browser rebuilds the transcript from it on every connect.
 const chatState = {
-  config: null, // { agents, models, efforts, defaultEffort, serverKey }
+  config: null, // { agents, providers, models, efforts, defaultEffort }
   configError: null,
   sessions: [],
   active: sessionStorage.getItem("rea-chat-active"),
-  apiKey: localStorage.getItem("rea-chat-apikey") ?? "",
-  model: localStorage.getItem("rea-chat-model"),
+  provider: localStorage.getItem("rea-chat-provider") ?? "anthropic",
+  // Keys and models are kept per provider, so switching back and forth loses nothing.
+  keys: { anthropic: localStorage.getItem("rea-chat-apikey") ?? "", openrouter: localStorage.getItem("rea-chat-openrouter-key") ?? "" },
+  model: localStorage.getItem("rea-chat-model"), // Anthropic model
+  orModel: localStorage.getItem("rea-chat-openrouter-model") ?? "",
+  orModels: null, // OpenRouter's tool-capable models, loaded on demand
+  orModelsError: null,
   agent: localStorage.getItem("rea-chat-agent"),
   effort: localStorage.getItem("rea-chat-effort"),
   busy: false,
@@ -1745,11 +1754,49 @@ async function loadChatConfig() {
     chatState.config = cfg;
     chatState.configError = null;
     if (!cfg.models.some((m) => m.id === chatState.model)) chatState.model = cfg.models[0].id;
+    if (!cfg.providers?.some((p) => p.id === chatState.provider)) chatState.provider = "anthropic";
     if (!cfg.agents.some((a) => a.id === chatState.agent)) chatState.agent = cfg.agents[0].id;
     if (!cfg.efforts.includes(chatState.effort)) chatState.effort = cfg.defaultEffort;
   } catch (err) {
     chatState.configError = err.message;
   }
+}
+
+const KEY_STORAGE = { anthropic: "rea-chat-apikey", openrouter: "rea-chat-openrouter-key" };
+const chatProvider = () => chatState.config?.providers?.find((p) => p.id === chatState.provider) ?? { id: "anthropic", keyLabel: "Anthropic API key", keyPlaceholder: "sk-ant-…", keyEnv: "ANTHROPIC_API_KEY", serverKey: chatState.config?.serverKey };
+const chatKey = () => chatState.keys[chatState.provider] ?? "";
+const hasChatKey = () => Boolean(chatKey() || chatProvider().serverKey);
+const chatModel = () => (chatState.provider === "openrouter" ? chatState.orModel : chatState.model);
+function setChatKey(value) {
+  chatState.keys[chatState.provider] = value.trim();
+  localStorage.setItem(KEY_STORAGE[chatState.provider], chatState.keys[chatState.provider]);
+}
+// What a new chat is created with; every chat (main page and per-app) uses the same settings.
+const newChatBody = (extra = {}) => ({ provider: chatState.provider, apiKey: chatKey(), model: chatModel(), ...extra });
+function chatModelLabel(session) {
+  if (session.provider === "openrouter") return `${chatState.orModels?.find((m) => m.id === session.model)?.label ?? session.model} via OpenRouter`;
+  return chatState.config?.models.find((m) => m.id === session.model)?.label ?? session.model;
+}
+
+// Strong tool-using defaults, in order; otherwise OpenRouter's auto router picks per request.
+const OPENROUTER_DEFAULTS = [/^anthropic\/claude-sonnet-5/, /^anthropic\/claude-opus-5/, /^anthropic\/claude-sonnet/, /^openai\/gpt-5/, /^google\/gemini-.*pro/];
+async function loadOpenRouterModels(refresh = false) {
+  try {
+    chatState.orModels = (await api("/api/chat/models", { method: "POST", body: { provider: "openrouter", apiKey: chatState.keys.openrouter, refresh } })).models;
+    chatState.orModelsError = null;
+    if (!chatState.orModel) {
+      const pick = OPENROUTER_DEFAULTS.map((re) => chatState.orModels.filter((m) => re.test(m.id)).sort((a, b) => b.id.localeCompare(a.id))[0]).find(Boolean);
+      chatState.orModel = pick?.id ?? "openrouter/auto";
+    }
+  } catch (err) {
+    chatState.orModelsError = err.message;
+  }
+}
+// Not having a key or model is reported in words the user can act on, wherever the chat is.
+function chatSetupProblem() {
+  if (!hasChatKey()) return `Add your ${chatProvider().keyLabel} in Chat settings to ask questions.`;
+  if (!chatModel()) return "Pick a model in Chat settings.";
+  return null;
 }
 
 async function loadChatSessions() {
@@ -2053,7 +2100,7 @@ function renderChatList() {
         { class: `chat-list-row ${s.id === chatState.active ? "active" : ""}` },
         h("button", {
           class: "chat-list-item",
-          title: `${s.model} · ${s.agent}`,
+          title: `${chatModelLabel(s)} · ${s.agent}`,
           text: `${s.busy ? "◌ " : ""}${s.title ?? "Untitled chat"}`,
           onclick: () => {
             setActiveChat(s.id);
@@ -2142,40 +2189,15 @@ async function renderChat() {
 
   let top;
   if (active) {
-    const model = cfg.models.find((m) => m.id === active.model);
     const agent = cfg.agents.find((a) => a.id === active.agent);
-    top = h("div", { class: "chat-header" }, h("h1", { text: active.title ?? "Chat" }), h("p", { class: "muted", text: `${agent?.label ?? active.agent} · ${model?.label ?? active.model}` }));
+    top = h("div", { class: "chat-header" }, h("h1", { text: active.title ?? "Chat" }), h("p", { class: "muted", text: `${agent?.label ?? active.agent} · ${chatModelLabel(active)}` }));
   } else {
-    const keyInput = h("input", {
-      type: "password",
-      id: "chat-key",
-      autocomplete: "off",
-      placeholder: cfg.serverKey ? "Using ANTHROPIC_API_KEY from the server" : "sk-ant-…",
-      value: chatState.apiKey,
-      oninput: (e) => (chatState.apiKey = e.target.value.trim()),
-    });
-    const modelSelect = h(
-      "select",
-      { id: "chat-model", onchange: (e) => localStorage.setItem("rea-chat-model", (chatState.model = e.target.value)) },
-      ...cfg.models.map((m) => h("option", { value: m.id, text: m.label, title: m.note, selected: m.id === chatState.model })),
-    );
-    const agentSelect = h(
-      "select",
-      { id: "chat-agent", onchange: (e) => localStorage.setItem("rea-chat-agent", (chatState.agent = e.target.value)) },
-      ...cfg.agents.map((a) => h("option", { value: a.id, text: a.label, title: a.description, selected: a.id === chatState.agent })),
-    );
     top = h(
       "div",
       { class: "chat-header" },
       h("h1", { text: "Chat with REA" }),
-      h("p", { class: "muted", text: "Describe what you want to know. Claude finds and runs the right REA tools and asks before running anything that changes state." }),
-      h(
-        "div",
-        { class: "chat-settings" },
-        h("label", { class: "chat-field" }, h("span", { text: "Anthropic API key" }), keyInput, h("small", { class: "muted", text: "Stored in this browser only and sent to your local REA Studio server." })),
-        h("label", { class: "chat-field" }, h("span", { text: "Model" }), modelSelect),
-        h("label", { class: "chat-field" }, h("span", { text: "Assistant" }), agentSelect),
-      ),
+      h("p", { class: "muted", text: "Describe what you want to know. The assistant finds and runs the right REA tools and asks before running anything that changes state." }),
+      chatSettings(cfg),
     );
   }
 
@@ -2194,6 +2216,93 @@ async function renderChat() {
   prompt.focus();
 }
 
+// Provider, key, model and assistant for new chats. Existing chats keep the settings they started with.
+function chatSettings(cfg) {
+  const provider = chatProvider();
+  const providerSelect = h(
+    "select",
+    {
+      id: "chat-provider",
+      onchange: (e) => {
+        localStorage.setItem("rea-chat-provider", (chatState.provider = e.target.value));
+        renderChat();
+      },
+    },
+    ...cfg.providers.map((p) => h("option", { value: p.id, text: p.label, selected: p.id === chatState.provider })),
+  );
+  const keyInput = h("input", {
+    type: "password",
+    id: "chat-key",
+    autocomplete: "off",
+    placeholder: provider.serverKey ? `Using ${provider.keyEnv} from the server` : provider.keyPlaceholder,
+    value: chatKey(),
+    onchange: (e) => {
+      setChatKey(e.target.value);
+      // A new key may unlock a model list that failed without one.
+      if (chatState.provider === "openrouter" && chatState.orModelsError) loadOpenRouterModels(true).then(() => location.hash === "#/chat" && renderChat());
+    },
+  });
+  const keyHelp =
+    chatState.provider === "openrouter"
+      ? h("small", { class: "muted" }, "Create one at ", h("a", { href: "https://openrouter.ai/settings/keys", target: "_blank", rel: "noopener", text: "openrouter.ai/settings/keys" }), ". Stored in this browser only and sent to your local REA Studio server.")
+      : h("small", { class: "muted" }, "Create one at ", h("a", { href: "https://platform.claude.com/settings/keys", target: "_blank", rel: "noopener", text: "platform.claude.com" }), ". Stored in this browser only and sent to your local REA Studio server.");
+  const agentSelect = h(
+    "select",
+    { id: "chat-agent", onchange: (e) => localStorage.setItem("rea-chat-agent", (chatState.agent = e.target.value)) },
+    ...cfg.agents.map((a) => h("option", { value: a.id, text: a.label, title: a.description, selected: a.id === chatState.agent })),
+  );
+  return h(
+    "div",
+    { class: "chat-settings" },
+    h("label", { class: "chat-field" }, h("span", { text: "Provider" }), providerSelect),
+    h("label", { class: "chat-field" }, h("span", { text: provider.keyLabel }), keyInput, keyHelp),
+    chatState.provider === "openrouter" ? openRouterModelField() : h("label", { class: "chat-field" }, h("span", { text: "Model" }), h("select", { id: "chat-model", onchange: (e) => localStorage.setItem("rea-chat-model", (chatState.model = e.target.value)) }, ...cfg.models.map((m) => h("option", { value: m.id, text: m.label, title: m.note, selected: m.id === chatState.model })))),
+    h("label", { class: "chat-field" }, h("span", { text: "Assistant" }), agentSelect),
+  );
+}
+
+// OpenRouter lists hundreds of models: a searchable field, with the chosen model's price underneath.
+function openRouterModelField() {
+  const field = h("label", { class: "chat-field chat-field-wide" }, h("span", { text: "Model" }));
+  if (!chatState.orModels && !chatState.orModelsError) {
+    field.append(h("input", { disabled: true, placeholder: "Loading OpenRouter models…" }));
+    loadOpenRouterModels().then(() => location.hash === "#/chat" && !chatState.active && renderChat());
+    return field;
+  }
+  if (chatState.orModelsError) {
+    const input = h("input", { id: "chat-model", value: chatState.orModel, placeholder: "e.g. anthropic/claude-sonnet-5.5", onchange: (e) => localStorage.setItem("rea-chat-openrouter-model", (chatState.orModel = e.target.value.trim())) });
+    field.append(input, h("small", { class: "chat-error-text" }, `${chatState.orModelsError} You can still type a model ID. `, h("button", { class: "link", type: "button", text: "Try again", onclick: () => ((chatState.orModelsError = null), renderChat()) })));
+    return field;
+  }
+  const models = chatState.orModels;
+  const note = h("small", { class: "muted" });
+  const describe = (id) => {
+    const m = models.find((x) => x.id === id);
+    const matches = id ? models.filter((x) => `${x.id} ${x.label}`.toLowerCase().includes(id.toLowerCase())).length : 0;
+    note.textContent = m
+      ? [m.label, m.note, m.reasoning ? "supports reasoning" : null].filter(Boolean).join(" · ")
+      : !id
+        ? `${models.length} tool-capable models. Type to search by name or ID.`
+        : matches
+          ? `${matches} matching models. Pick one from the list.`
+          : "Not in OpenRouter's list of tool-capable models; chats may fail.";
+  };
+  const list = h("datalist", { id: "openrouter-models" }, ...models.map((m) => h("option", { value: m.id, label: m.note ? `${m.label} · ${m.note}` : m.label })));
+  const input = h("input", {
+    id: "chat-model",
+    list: "openrouter-models",
+    value: chatState.orModel,
+    spellcheck: false,
+    autocomplete: "off",
+    placeholder: "Search models, e.g. claude, gpt, gemini, qwen",
+    oninput: (e) => describe(e.target.value.trim()),
+    onchange: (e) => localStorage.setItem("rea-chat-openrouter-model", (chatState.orModel = e.target.value.trim())),
+  });
+  describe(chatState.orModel);
+  field.append(input, list, note);
+  return field;
+}
+
 async function sendChatMessage() {
   const prompt = document.getElementById("chat-prompt");
   const text = prompt?.value.trim();
@@ -2204,15 +2313,20 @@ async function sendChatMessage() {
   };
 
   if (!chatState.active) {
-    if (!chatState.apiKey && !cfg.serverKey) {
-      showError("Enter your Anthropic API key first.");
-      return document.getElementById("chat-key")?.focus();
+    // The model field commits on change; read it directly in case it still has focus.
+    const typed = document.getElementById("chat-model")?.value?.trim();
+    if (typed && chatState.provider === "openrouter") localStorage.setItem("rea-chat-openrouter-model", (chatState.orModel = typed));
+    const keyField = document.getElementById("chat-key");
+    if (keyField && keyField.value.trim() !== chatKey()) setChatKey(keyField.value);
+    const problem = chatSetupProblem();
+    if (problem) {
+      showError(problem);
+      return document.getElementById(hasChatKey() ? "chat-model" : "chat-key")?.focus();
     }
     const agent = cfg.agents.find((a) => a.id === chatState.agent);
     if (agent?.usesRea && state.status?.state !== "ready") return showError("REA isn't running yet. Wait for it to start, or restart it from the top bar.");
     try {
-      const sess = await api("/api/chat/sessions", { method: "POST", body: { apiKey: chatState.apiKey, model: chatState.model, agent: chatState.agent } });
-      if (chatState.apiKey) localStorage.setItem("rea-chat-apikey", chatState.apiKey);
+      const sess = await api("/api/chat/sessions", { method: "POST", body: newChatBody({ agent: chatState.agent }) });
       setActiveChat(sess.id);
       prompt.value = "";
       await renderChat(); // switches to the session view and opens its stream
