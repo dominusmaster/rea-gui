@@ -7,7 +7,7 @@
 import { ChatSession } from "./agent.mjs";
 
 const BASE_URL = () => (process.env.OPENROUTER_BASE_URL || "https://openrouter.ai/api/v1").replace(/\/+$/, "");
-const HEADERS = { "HTTP-Referer": "https://github.com/dominusmaster/rea-studio", "X-Title": "REA Studio" };
+const HEADERS = { "HTTP-Referer": "https://github.com/dominusmaster/rea-gui", "X-Title": "REA GUI" };
 const MAX_OUTPUT = 32_000;
 const SEARCH_LIMIT = 8;
 

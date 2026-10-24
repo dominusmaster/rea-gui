@@ -1,0 +1,46 @@
+<!doctype html>
+<html lang="en">
+  <head>
+    <meta charset="utf-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1" />
+    <title>Sign in · REA GUI</title>
+    <link rel="icon" type="image/svg+xml" href="/icon.svg" />
+    <link rel="stylesheet" href="/style.css" />
+  </head>
+  <body class="login-page">
+    <main class="login card">
+      <div class="brand"><img class="logo" src="/icon.svg" alt="" width="28" height="28" /> REA GUI</div>
+      <h1>Sign in</h1>
+      <p class="muted">This REA GUI server is password-protected. The password is the <code>REA_GUI_PASSWORD</code> it was started with.</p>
+      <form id="login">
+        <label class="field-label" for="password">Password</label>
+        <input id="password" type="password" autocomplete="current-password" required autofocus />
+        <p class="error-text" id="error" role="alert" hidden></p>
+        <button class="primary" type="submit">Sign in</button>
+      </form>
+    </main>
+    <script type="module">
+      const form = document.getElementById("login");
+      const error = document.getElementById("error");
+      form.addEventListener("submit", async (e) => {
+        e.preventDefault();
+        const button = form.querySelector("button");
+        button.disabled = true;
+        error.hidden = true;
+        try {
+          const res = await fetch("/api/login", {
+            method: "POST",
+            headers: { "content-type": "application/json" },
+            body: JSON.stringify({ password: document.getElementById("password").value }),
+          });
+          if (res.ok) return location.replace("/");
+          error.textContent = (await res.json().catch(() => null))?.error ?? `Sign-in failed (${res.status})`;
+        } catch {
+          error.textContent = "Can't reach the REA GUI server. Check that it's running.";
+        }
+        error.hidden = false;
+        button.disabled = false;
+      });
+    </script>
+  </body>
+</html>

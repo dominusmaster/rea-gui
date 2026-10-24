@@ -1,7 +1,7 @@
 {
   "name": "rea-gui",
   "version": "0.1.0",
-  "description": "Local web GUI for REA (Reverse Engineer Anything): run every REA MCP tool from a browser.",
+  "description": "Visual interface for REA (Reverse Engineer Anything): guided app analysis, chat and every REA tool, locally or on a server.",
   "type": "module",
   "bin": {
     "rea-gui": "bin/rea-gui.mjs"
@@ -14,7 +14,7 @@
   "scripts": {
     "start": "node bin/rea-gui.mjs",
     "smoke": "node test/smoke.mjs",
-    "test": "node test/smoke.mjs && node test/chat.mjs && node test/analyses.mjs"
+    "test": "node test/smoke.mjs && node test/chat.mjs && node test/analyses.mjs && node test/server.mjs"
   },
   "dependencies": {
     "@anthropic-ai/sdk": "^1.1.0",
@@ -34,8 +34,11 @@
   "license": "MIT",
   "repository": {
     "type": "git",
-    "url": "git+https://github.com/dominusmaster/rea-studio.git",
+    "url": "git+https://github.com/dominusmaster/rea-gui.git",
     "directory": "rea-gui"
   },
-  "homepage": "https://github.com/dominusmaster/rea-studio#readme"
+  "homepage": "https://github.com/dominusmaster/rea-gui#readme",
+  "bugs": {
+    "url": "https://github.com/dominusmaster/rea-gui/issues"
+  }
 }

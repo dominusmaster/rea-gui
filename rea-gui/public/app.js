@@ -1,7 +1,10 @@
-// REA Studio frontend. All target-derived text is rendered with textContent, never innerHTML.
+// REA GUI frontend. All target-derived text is rendered with textContent, never innerHTML.
 import { isEvidence, renderEvidence, drillPanel, renderFacts } from "/evidence.js";
 import { classify, KINDS, runAnalysis, restoreAnalysis } from "/analyze.js";
 const token = document.querySelector('meta[name="rea-gui-token"]').content;
+// "server": REA GUI runs on another machine, so files are uploaded rather than picked from this computer.
+const serverMode = document.querySelector('meta[name="rea-gui-mode"]')?.content === "server";
+const passwordAuth = document.querySelector('meta[name="rea-gui-auth"]')?.content === "password";
 const $ = (sel) => document.querySelector(sel);
 const main = $("#main");
 
@@ -63,12 +66,17 @@ async function api(path, { method = "GET", body } = {}) {
     });
   } catch {
     setConnection("lost");
-    throw new Error("Can't reach the REA Studio server. Check that it's still running.");
+    throw new Error("Can't reach the REA GUI server. Check that it's still running.");
   }
-  // Each server start issues a new token, so a 401 means the server restarted under this page.
+  // Each server start issues a new token, so a 401 means the server restarted under this page,
+  // or, on a password-protected server, that the sign-in expired.
   if (res.status === 401) {
+    if ((await res.clone().json().catch(() => null))?.signIn) {
+      location.href = "/login.html";
+      throw new Error("Signed out. Sign in again to continue.");
+    }
     setConnection("restarted");
-    throw new Error("REA Studio restarted. Reload the page to continue.");
+    throw new Error("REA GUI restarted. Reload the page to continue.");
   }
   const data = await res.json();
   if (!res.ok) throw new Error(data.error ?? `HTTP ${res.status}`);
@@ -98,7 +106,7 @@ function renderStatus() {
 }
 
 // Explain a failed REA start in place, with the server's last error lines.
-// ---------- connection to the REA Studio server ----------
+// ---------- connection to the REA GUI server ----------
 // "ok", "lost" (server unreachable; retried until it's back) or "restarted" (new token: the page must reload).
 let connection = "ok";
 let connectionPoll = null;
@@ -112,6 +120,7 @@ function setConnection(next) {
 async function checkConnection() {
   try {
     const res = await fetch("/api/status", { headers: { "x-rea-gui-token": token } });
+    if (res.status === 401 && (await res.json().catch(() => null))?.signIn) return (location.href = "/login.html");
     setConnection(res.status === 401 ? "restarted" : "ok");
   } catch {
     setConnection("lost");
@@ -124,11 +133,11 @@ async function renderBanner() {
     banner.replaceChildren(
       ...(connection === "lost"
         ? [
-            h("strong", { text: "Can't reach the REA Studio server. " }),
-            h("span", { text: "It may have stopped. Start it again from the rea-gui folder with npm start; this page reconnects by itself." }),
+            h("strong", { text: "Can't reach the REA GUI server. " }),
+            h("span", { text: serverMode ? "It may have stopped or be restarting. This page reconnects by itself." : "It may have stopped. Start it again from the rea-gui folder with npm start; this page reconnects by itself." }),
           ]
         : [
-            h("strong", { text: "REA Studio restarted. " }),
+            h("strong", { text: "REA GUI restarted. " }),
             h("span", { text: "Reload this page to reconnect. Saved analyses are kept." }),
             h("div", { class: "actions" }, h("button", { class: "primary", text: "Reload page", onclick: () => location.reload() })),
           ]),
@@ -588,13 +597,13 @@ function latestAnalysisFor(key) {
 
 function appChatContext(key) {
   if (key === "general") {
-    return "## This conversation\nNo app is open in REA Studio yet. Help the user pick and analyze one; any app or binary on this computer is in scope.";
+    return "## This conversation\nNo app is open in REA GUI yet. Help the user pick and analyze one; any app or binary on this computer is in scope.";
   }
   const analysis = latestAnalysisFor(key);
   const name = analysis?.name ?? fileName(key);
   const lines = [
     "## This conversation",
-    "The user is working on one app in REA Studio, moving between its analysis and individual REA tools, and asks about it here.",
+    "The user is working on one app in REA GUI, moving between its analysis and individual REA tools, and asks about it here.",
     `- Name: ${name}`,
     analysis ? `- Kind: ${KINDS[analysis.kind]?.label ?? analysis.kind}` : null,
     `- Path: ${key}`,
@@ -602,7 +611,7 @@ function appChatContext(key) {
     `Stay on this app. Answer only questions about ${name}, and point REA tools at this path or files inside it. If the user asks about anything else, say this chat is for ${name} and suggest the Chat page in the sidebar.`,
   ].filter((l) => l !== null);
   if (analysis?.results?.length) {
-    lines.push("", "## Results of REA Studio's guided analysis", analysis.state === "running" ? "(The analysis was still running, so this may be incomplete.)" : "");
+    lines.push("", "## Results of REA GUI's guided analysis", analysis.state === "running" ? "(The analysis was still running, so this may be incomplete.)" : "");
     for (const r of analysis.results) {
       lines.push(`### ${r.check}: ${r.headline ?? ""}`);
       for (const f of r.findings) lines.push(`- ${f}`);
@@ -789,7 +798,7 @@ function appChat(key) {
               h("span", { class: "muted small", text: s.busy ? "Running" : relTime(s.createdAt) }),
             ),
           )
-        : [h("p", { class: "muted small", text: "No earlier chats yet. They're kept until REA Studio restarts." })]),
+        : [h("p", { class: "muted small", text: "No earlier chats yet. They're kept until REA GUI restarts." })]),
     );
   }
 
@@ -893,6 +902,22 @@ function startAnalysis(detected, kind) {
   state.analyses = [analysis, ...state.analyses.filter((a) => a !== analysis && a.path !== detected.path)];
   renderAnalysisList();
   location.hash = `#/analysis/${analysis.id}`;
+}
+
+// XMLHttpRequest rather than fetch: it reports upload progress.
+function uploadFile(file, onProgress) {
+  return new Promise((resolve, reject) => {
+    const xhr = new XMLHttpRequest();
+    xhr.open("POST", `/api/upload?name=${encodeURIComponent(file.name)}`);
+    xhr.setRequestHeader("x-rea-gui-token", token);
+    xhr.upload.onprogress = (e) => e.lengthComputable && onProgress?.(e.loaded / e.total);
+    xhr.onload = () => {
+      const data = JSON.parse(xhr.responseText || "{}");
+      xhr.status < 300 ? resolve(data) : reject(new Error(data.error ?? `HTTP ${xhr.status}`));
+    };
+    xhr.onerror = () => reject(new Error("Can't reach the REA GUI server."));
+    xhr.send(file);
+  });
 }
 
 async function analyzePath(path) {
@@ -1068,25 +1093,58 @@ async function renderHome() {
   const filter = h("input", { type: "search", placeholder: "Filter apps…", class: "filter", "aria-label": "Filter installed apps" });
   const grid = h("div", { class: "app-grid" }, h("div", { class: "empty", text: "Looking for installed apps…" }));
 
+  // On a server, files come from this computer by upload (button or drag and drop).
+  const upload = async (file) => {
+    if (!file) return;
+    hint.className = "detect-hint muted";
+    hint.textContent = `Uploading ${file.name}…`;
+    try {
+      const saved = await uploadFile(file, (fraction) => (hint.textContent = `Uploading ${file.name}… ${Math.round(fraction * 100)}%`));
+      input.value = saved.path;
+      await runCheck();
+      if (pending) startAnalysis(pending.detected, pending.kind);
+    } catch (err) {
+      showError(`Upload failed: ${err.message}`);
+    }
+  };
+  const fileInput = h("input", { type: "file", class: "hidden", onchange: (e) => upload(e.target.files[0]) });
+  const pickButtons = serverMode
+    ? [h("button", { text: "Upload file", onclick: () => fileInput.click() }), h("button", { class: "ghost", text: "Browse server", title: "Pick a file that's already on the server", onclick: async () => ((input.value = (await pickPath(input.value)) ?? input.value), check()) })]
+    : [h("button", { text: "Choose file", onclick: async () => ((input.value = (await pickPath(input.value)) ?? input.value), check()) })];
+  const hero = h(
+    "div",
+    { class: "card hero" },
+    h("label", { class: "field-label", for: "target-path", text: "App or file to analyze" }),
+    h("div", {
+      class: "muted small",
+      text: serverMode
+        ? `Upload a file from your computer (or drop it here), or enter the path of a file already on the server. Works with ${SUPPORTED}. A Mac .app is a folder: zip it first, or upload its app.asar or main executable.`
+        : `Paste its full path, for example /Applications/Slack.app or ~/Downloads/app.apk. Works with ${SUPPORTED}.`,
+    }),
+    hint,
+    h("div", { class: "input-row" }, input, ...pickButtons, go),
+    fileInput,
+  );
+  if (serverMode) {
+    hero.addEventListener("dragover", (e) => (e.preventDefault(), hero.classList.add("drop")));
+    hero.addEventListener("dragleave", () => hero.classList.remove("drop"));
+    hero.addEventListener("drop", (e) => (e.preventDefault(), hero.classList.remove("drop"), upload(e.dataTransfer.files[0])));
+  }
+
   setMain(
     h("h1", { class: "hero-title", text: "What do you want to look inside?" }),
-    h("p", { class: "lede", text: "REA reads apps and binaries without running them, then explains what it found: who signed it, what it can access, how it's built and what it exposes." }),
-    h(
-      "div",
-      { class: "card hero" },
-      h("label", { class: "field-label", for: "target-path", text: "App or file to analyze" }),
-      h("div", { class: "muted small", text: `Paste its full path, for example /Applications/Slack.app or ~/Downloads/app.apk. Works with ${SUPPORTED}.` }),
-      hint,
-      h("div", { class: "input-row" }, input, h("button", { text: "Choose file", onclick: async () => ((input.value = (await pickPath(input.value)) ?? input.value), check()) }), go),
-    ),
-    h("div", { class: "row-between" }, h("h2", { text: "Or pick an installed app" }), filter),
-    grid,
+    h("p", { class: "lede", text: "REA (Reverse Engineer Anything) reads apps and binaries without running them, then explains what it found: who signed it, what it can access, how it's built and what it exposes." }),
+    hero,
+    serverMode ? null : h("div", { class: "row-between" }, h("h2", { text: "Or pick an installed app" }), filter),
+    serverMode ? null : grid,
+    h("p", { class: "muted small legal-note", text: "Only analyze software you own or have permission to analyze, and follow its license and the law where you live." }),
     h("div", { id: "readiness" }),
   );
   input.focus();
   if (typed.trim()) runCheck();
   renderReadiness();
 
+  if (serverMode) return;
   if (!state.apps) {
     try {
       state.apps = (await api("/api/apps")).apps;
@@ -1148,7 +1206,7 @@ function renderReadiness() {
     h(
       "details",
       { class: "card readiness" },
-      h("summary", {}, h("strong", { text: "What works on this Mac" }), h("span", { class: "muted", text: ` · ${ready} of ${rows.length} kinds of analysis ready` })),
+      h("summary", {}, h("strong", { text: serverMode ? "What works on this server" : "What works on this computer" }), h("span", { class: "muted", text: ` · ${ready} of ${rows.length} kinds of analysis ready` })),
       h(
         "ul",
         { class: "capabilities" },
@@ -1790,6 +1848,8 @@ $("#target-close").addEventListener("click", () => runQuick("close_binary", {}))
 $("#nav-home").addEventListener("click", () => (location.hash = "#/"));
 $("#toggle-log").addEventListener("click", () => $("#log-panel").classList.toggle("hidden"));
 $("#close-log").addEventListener("click", () => $("#log-panel").classList.add("hidden"));
+if (passwordAuth) $("#sign-out").classList.remove("hidden");
+$("#sign-out").addEventListener("click", () => fetch("/api/logout", { method: "POST" }).finally(() => location.replace("/login.html")));
 $("#restart").addEventListener("click", () => api("/api/restart", { method: "POST" }).catch((err) => alert(err.message)));
 
 // ---------- Chat ----------
@@ -2206,7 +2266,7 @@ async function renderChat() {
           h("p", { text: `Couldn't load chat settings: ${chatState.configError}` }),
           h("p", {
             class: "muted",
-            text: "If you just updated REA Studio, the web server is still running the old code. Stop it (Ctrl+C in its terminal) and run node bin/rea-gui.mjs again, then reload this page. The Restart REA button only restarts REA's tools, not this server.",
+            text: "If you just updated REA GUI, the web server is still running the old code. Stop it (Ctrl+C in its terminal) and run node bin/rea-gui.mjs again, then reload this page. The Restart REA button only restarts REA's tools, not this server.",
           }),
           h("button", { class: "primary", text: "Try again", onclick: () => renderChat() }),
         ),
@@ -2312,8 +2372,8 @@ function chatSettings(cfg) {
   });
   const keyHelp =
     chatState.provider === "openrouter"
-      ? h("small", { class: "muted" }, "Create one at ", h("a", { href: "https://openrouter.ai/settings/keys", target: "_blank", rel: "noopener", text: "openrouter.ai/settings/keys" }), ". Stored in this browser only and sent to your local REA Studio server.")
-      : h("small", { class: "muted" }, "Create one at ", h("a", { href: "https://platform.claude.com/settings/keys", target: "_blank", rel: "noopener", text: "platform.claude.com" }), ". Stored in this browser only and sent to your local REA Studio server.");
+      ? h("small", { class: "muted" }, "Create one at ", h("a", { href: "https://openrouter.ai/settings/keys", target: "_blank", rel: "noopener", text: "openrouter.ai/settings/keys" }), ". Stored in this browser only and sent to your local REA GUI server.")
+      : h("small", { class: "muted" }, "Create one at ", h("a", { href: "https://platform.claude.com/settings/keys", target: "_blank", rel: "noopener", text: "platform.claude.com" }), ". Stored in this browser only and sent to your local REA GUI server.");
   const agentSelect = h(
     "select",
     { id: "chat-agent", onchange: (e) => localStorage.setItem("rea-chat-agent", (chatState.agent = e.target.value)) },

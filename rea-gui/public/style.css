@@ -1,5 +1,5 @@
 /*
- * REA Studio styles, following the shadcn/ui design system (zinc theme, "new-york" style):
+ * REA GUI styles, following the shadcn/ui design system (zinc theme, "new-york" style):
  * neutral surfaces, one dark/light primary, 36px controls, rounded-md corners,
  * hairline borders, xs/sm shadows and a 3px focus ring.
  */
@@ -980,3 +980,13 @@ main > * { margin-left: max(0px, calc((100cqw - 1200px) / 2)) !important; }
   .library-row-desc { grid-column: 1 / -1; }
 }
 .library-row { white-space: normal; }
+
+/* ---------- sign-in (server deployments) ---------- */
+.login-page { display: grid; place-items: center; min-height: 100vh; margin: 0; padding: 16px; background: var(--sidebar); }
+.login { width: min(400px, 100%); padding: 24px; }
+.login h1 { margin: 20px 0 6px; font-size: 20px; }
+.login form { display: grid; gap: 8px; margin-top: 16px; }
+.login form button { margin-top: 8px; }
+.login code { font-family: var(--mono); font-size: 12px; }
+.card.hero.drop { border-color: var(--ring); box-shadow: 0 0 0 3px color-mix(in oklab, var(--ring) 40%, transparent); }
+.legal-note { margin-top: 24px; }

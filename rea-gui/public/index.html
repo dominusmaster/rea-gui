@@ -4,19 +4,22 @@
     <meta charset="utf-8" />
     <meta name="viewport" content="width=device-width, initial-scale=1" />
     <meta name="rea-gui-token" content="__REA_GUI_TOKEN__" />
-    <title>REA Studio</title>
+    <meta name="rea-gui-mode" content="__REA_GUI_MODE__" />
+    <meta name="rea-gui-auth" content="__REA_GUI_AUTH__" />
+    <title>REA GUI</title>
     <link rel="icon" type="image/svg+xml" href="/icon.svg" />
     <link rel="stylesheet" href="/style.css" />
   </head>
   <body>
     <header class="topbar">
       <button class="ghost icon-button sidebar-toggle" id="sidebar-toggle" aria-label="Open menu" aria-controls="sidebar" aria-expanded="false"><svg class="icon" viewBox="0 0 24 24" aria-hidden="true"><path d="M4 6h16"/><path d="M4 12h16"/><path d="M4 18h16"/></svg></button>
-      <div class="brand"><img class="logo" src="/icon.svg" alt="" width="28" height="28" /> REA Studio</div>
+      <div class="brand"><img class="logo" src="/icon.svg" alt="" width="28" height="28" /> REA GUI</div>
       <div class="status" id="status"><span class="dot"></span><span id="status-text">Connecting…</span></div>
       <div class="target hidden" id="target"><span class="muted">Open file</span> <strong id="target-text"></strong> <button class="ghost small" id="target-close" title="Close the active target">Close</button></div>
       <div class="topbar-actions">
         <button class="ghost" id="toggle-log" title="Show REA server log">Show server log</button>
         <button class="ghost tertiary" id="restart" title="Restart the REA MCP server">Restart REA</button>
+        <button class="ghost tertiary hidden" id="sign-out" title="Sign out of this REA GUI server">Sign out</button>
       </div>
     </header>
 

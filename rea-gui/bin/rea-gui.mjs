@@ -3,13 +3,15 @@
 import { createServer } from "node:http";
 import { spawn, spawnSync } from "node:child_process";
 import { createHash, randomBytes } from "node:crypto";
-import { existsSync, mkdirSync, readFileSync } from "node:fs";
-import { open as openFile, readdir, stat, readFile } from "node:fs/promises";
+import { createWriteStream, existsSync, mkdirSync, readFileSync } from "node:fs";
+import { mkdir, open as openFile, readdir, rm, stat, readFile } from "node:fs/promises";
+import { pipeline } from "node:stream/promises";
 import { homedir, platform, tmpdir } from "node:os";
 import { dirname, extname, join, resolve, sep } from "node:path";
 import { fileURLToPath } from "node:url";
 import { McpStdioClient } from "../lib/mcp-client.mjs";
 import { AnalysisStore } from "../lib/analyses.mjs";
+import { PasswordAuth, isLoopback } from "../lib/auth.mjs";
 import { TargetBroker } from "../lib/target.mjs";
 import { AnthropicSession, MODELS, EFFORTS, DEFAULT_EFFORT, PROVIDERS, publicAgents } from "../lib/agent.mjs";
 import { OpenRouterSession, listOpenRouterModels } from "../lib/openrouter.mjs";
@@ -30,7 +32,14 @@ if (flag("help") || flag("h")) {
 
 Usage: rea-gui [--port N] [--host 127.0.0.1] [--no-open]
 
+On a server, listen on all interfaces and set a password:
+  REA_GUI_PASSWORD=… rea-gui --host 0.0.0.0 --no-open
+
 Environment:
+  REA_GUI_HOST, PORT        Same as --host and --port
+  REA_GUI_PASSWORD  Required to listen on anything but 127.0.0.1
+  REA_GUI_TRUST_PROXY=1     Behind a reverse proxy: trust X-Forwarded-For
+  REA_GUI_MAX_UPLOAD_MB     Largest upload (default 4096)
   REA_BIN    Path to REA's scripts/rea.mjs or a rea executable
   REA_NODE   Node.js binary used to run REA (must satisfy REA's engines)
   REA_GUI_DATA_DIR  Where saved analyses live (default ~/.rea-gui)
@@ -41,8 +50,18 @@ if (flag("version")) {
   console.log(pkg.version);
   process.exit(0);
 }
-const host = option("host", "127.0.0.1");
+const host = option("host", process.env.REA_GUI_HOST || "127.0.0.1");
 const port = Number(option("port", process.env.PORT ?? 4517));
+const dataDir = process.env.REA_GUI_DATA_DIR || join(homedir(), ".rea-gui");
+// On a server the page itself must be protected: anyone who loads it gets the API token.
+const auth = process.env.REA_GUI_PASSWORD ? new PasswordAuth(process.env.REA_GUI_PASSWORD) : null;
+const remote = !isLoopback(host);
+if (remote && !auth && process.env.REA_GUI_ALLOW_NO_PASSWORD !== "1") {
+  console.error(`Refusing to listen on ${host} without a password: anyone who reaches this address could read files and run REA tools on this machine.
+Set REA_GUI_PASSWORD, or (only behind your own authenticating proxy) REA_GUI_ALLOW_NO_PASSWORD=1.`);
+  process.exit(1);
+}
+const maxUpload = Number(process.env.REA_GUI_MAX_UPLOAD_MB || 4096) * 1024 * 1024;
 
 // ---------- Locate REA and a compatible Node ----------
 function nodeVersionSupported(version) {
@@ -113,7 +132,7 @@ const bootId = randomBytes(4).toString("hex");
 let callSeq = 0;
 // Identifies the running REA process. Evidence IDs from analyses only resolve in the run that made them.
 let reaRun = 0;
-const analyses = new AnalysisStore(join(process.env.REA_GUI_DATA_DIR || join(homedir(), ".rea-gui"), "analyses"));
+const analyses = new AnalysisStore(join(dataDir, "analyses"));
 let sessionRefresh = null;
 
 // ---------- Chat agent state ----------
@@ -353,7 +372,36 @@ async function listDirectory(path) {
 // ---------- HTTP server ----------
 const token = randomBytes(24).toString("hex");
 const allowedHosts = new Set([`${host}:${port}`, `localhost:${port}`, `127.0.0.1:${port}`]);
-const mime = { ".html": "text/html", ".js": "text/javascript", ".css": "text/css", ".svg": "image/svg+xml" };
+const mime = { ".html": "text/html", ".js": "text/javascript", ".css": "text/css", ".svg": "image/svg+xml", ".png": "image/png" };
+// Served before sign-in, so the sign-in page can render.
+const PUBLIC_FILES = new Set(["login.html", "style.css", "icon.svg"]);
+
+// Uploads land in their own folder each, keeping the original file name (REA uses it to tell formats apart).
+async function saveUpload(req, name) {
+  const safe = String(name ?? "").replace(/[/\\\0]/g, "_").replace(/^\.+/, "").slice(0, 200) || "upload";
+  const size = Number(req.headers["content-length"]);
+  if (Number.isFinite(size) && size > maxUpload) throw Object.assign(new Error(`File is larger than the ${Math.round(maxUpload / 1048576)} MB limit`), { status: 413 });
+  const dir = join(dataDir, "uploads", `${Date.now().toString(36)}-${randomBytes(4).toString("hex")}`);
+  await mkdir(dir, { recursive: true });
+  const path = join(dir, safe);
+  let received = 0;
+  try {
+    await pipeline(
+      req,
+      async function* (source) {
+        for await (const chunk of source) {
+          if ((received += chunk.length) > maxUpload) throw Object.assign(new Error(`File is larger than the ${Math.round(maxUpload / 1048576)} MB limit`), { status: 413 });
+          yield chunk;
+        }
+      },
+      createWriteStream(path),
+    );
+  } catch (err) {
+    await rm(dir, { recursive: true, force: true });
+    throw err;
+  }
+  return { path, name: safe, size: received };
+}
 
 function serverKey(provider) {
   if (provider === "openrouter") return Boolean(process.env.OPENROUTER_API_KEY);
@@ -378,22 +426,52 @@ async function readBody(req, limit = 1_000_000) {
 }
 
 const server = createServer(async (req, res) => {
-  // Refuse DNS-rebinding requests addressed to another host name.
-  if (!allowedHosts.has(req.headers.host)) {
+  // Locally, refuse DNS-rebinding requests addressed to another host name. A server is reached
+  // through its own domain, and the password protects it instead.
+  if (!remote && !allowedHosts.has(req.headers.host)) {
     res.writeHead(403).end("Forbidden host");
     return;
   }
-  const url = new URL(req.url, `http://${req.headers.host}`);
+  const url = new URL(req.url, `http://${req.headers.host ?? "localhost"}`);
 
   try {
+    // For hosting platforms' health checks; says nothing about what's analyzed.
+    if (url.pathname === "/healthz") return sendJson(res, 200, { ok: true, rea: client?.state ?? "stopped" });
+    if (auth && url.pathname === "/api/login" && req.method === "POST") {
+      const { password } = await readBody(req);
+      const result = auth.signIn(password, req);
+      if (!result.ok) return sendJson(res, result.status, { error: result.error });
+      res.setHeader("set-cookie", result.cookie);
+      return sendJson(res, 200, { ok: true });
+    }
+    if (auth && url.pathname === "/api/logout" && req.method === "POST") {
+      res.setHeader("set-cookie", auth.signOut(req));
+      return sendJson(res, 200, { ok: true });
+    }
+    if (auth && !auth.signedIn(req)) {
+      const file = url.pathname.slice(1);
+      if (url.pathname.startsWith("/api/")) return sendJson(res, 401, { error: "Sign in first", signIn: true });
+      if (url.pathname === "/" || url.pathname === "/index.html") return res.writeHead(302, { location: "/login.html" }).end();
+      if (!PUBLIC_FILES.has(file)) return res.writeHead(404).end("Not found");
+    }
+
     if (!url.pathname.startsWith("/api/")) {
       const file = url.pathname === "/" ? "index.html" : url.pathname.slice(1);
       const full = resolve(publicDir, file);
       if (!full.startsWith(publicDir + sep)) return res.writeHead(404).end();
       let body = await readFile(full).catch(() => null);
       if (!body) return res.writeHead(404).end("Not found");
-      if (file === "index.html") body = Buffer.from(body.toString("utf8").replace("__REA_GUI_TOKEN__", token));
-      res.writeHead(200, { "content-type": mime[extname(full)] ?? "application/octet-stream" });
+      if (file === "index.html") {
+        body = Buffer.from(body.toString("utf8").replace("__REA_GUI_TOKEN__", token).replace("__REA_GUI_MODE__", remote ? "server" : "local").replace("__REA_GUI_AUTH__", auth ? "password" : "none"));
+      }
+      // The page holds the API token: never let another site frame it or a cache keep it.
+      res.writeHead(200, {
+        "content-type": mime[extname(full)] ?? "application/octet-stream",
+        "x-content-type-options": "nosniff",
+        "x-frame-options": "DENY",
+        "referrer-policy": "no-referrer",
+        ...(file === "index.html" ? { "cache-control": "no-store" } : {}),
+      });
       return res.end(body);
     }
 
@@ -425,6 +503,9 @@ const server = createServer(async (req, res) => {
       if (!icon) return res.writeHead(404).end();
       res.writeHead(200, { "content-type": "image/png", "cache-control": "max-age=86400" });
       return res.end(await readFile(icon));
+    }
+    if (url.pathname === "/api/upload" && req.method === "POST") {
+      return sendJson(res, 201, await saveUpload(req, url.searchParams.get("name")));
     }
     if (url.pathname === "/api/detect") return sendJson(res, 200, await detectPath(url.searchParams.get("path")));
     if (url.pathname === "/api/fs") return sendJson(res, 200, await listDirectory(url.searchParams.get("path")));

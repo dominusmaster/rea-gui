@@ -1,0 +1,17 @@
+# docker compose up -d   then open http://<server>:4517 and sign in with REA_GUI_PASSWORD.
+# Put HTTPS in front (Caddy, nginx, a platform's proxy) before exposing it to the internet.
+services:
+  rea-gui:
+    build: .
+    ports:
+      - "4517:4517"
+    environment:
+      REA_GUI_PASSWORD: ${REA_GUI_PASSWORD:?Set REA_GUI_PASSWORD in .env or the environment}
+      # Optional: chat keys on the server, so users don't paste their own.
+      ANTHROPIC_API_KEY: ${ANTHROPIC_API_KEY:-}
+      OPENROUTER_API_KEY: ${OPENROUTER_API_KEY:-}
+    volumes:
+      - rea-gui-data:/data
+    restart: unless-stopped
+volumes:
+  rea-gui-data:
