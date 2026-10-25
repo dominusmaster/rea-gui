@@ -3,8 +3,12 @@
 # REA GUI brand
 
 **The mark: Scan.** An app tile with a scan beam passing through it. Inside the beam,
-the app's code shows through. It says what REA GUI does: see inside any app without
-running it.
+the app's code shows through: REA GUI shows what REA finds inside an app.
+
+**Voice.** REA GUI is the open-source, self-hosted GUI for REA. Talk to REA users and
+self-hosters: open source, runs on your machine, one command to start, your data stays
+with you. Lines aimed at a general audience, such as "see inside any app", belong to
+REAG (the hosted cloud service), not REA GUI.
 
 ## Files
 

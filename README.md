@@ -2,9 +2,9 @@
 
 # REA GUI
 
-A visual interface for [REA: Reverse Engineer Anything](https://github.com/morluto/rea).
-Open any app and see what's inside, without executing it. Run it on your computer,
-or deploy it to a server with Docker.
+The open-source GUI for [REA: Reverse Engineer Anything](https://github.com/morluto/rea).
+Self-host it: run it on your own computer in one command, or deploy it to your own
+server with Docker. Nothing you analyze is executed.
 
 ```bash
 git clone https://github.com/dominusmaster/rea-gui.git

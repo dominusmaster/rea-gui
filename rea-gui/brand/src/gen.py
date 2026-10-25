@@ -67,8 +67,9 @@ files = {
     "logo-light.svg": svg("0 0 1200 320", f'<rect width="1200" height="320" fill="#ffffff"/>' + icon_at(64, 64, 192) + wordmark(296, 200, 120, "#09090b", "#71717a")),
     "social.svg": svg("0 0 1280 640",
         f'<rect width="1280" height="640" fill="{INK}"/>' + icon_at(120, 170, 300) + wordmark(500, 300, 112, "#fafafa", "#a1a1aa")
-        + f'<text x="504" y="372" font-family="{FONT}" font-size="34" fill="#a1a1aa">See inside any app, without running it.</text>'
-        + f'<text x="504" y="440" font-family="ui-monospace, \'SF Mono\', Menlo, monospace" font-size="28" fill="{CYAN}">npx rea-gui</text>'),
+        + f'<text x="504" y="372" font-family="{FONT}" font-size="34" fill="#a1a1aa">The open-source GUI for REA.</text>'
+        + f'<text x="504" y="416" font-family="{FONT}" font-size="34" fill="#a1a1aa">Self-host it in one command.</text>'
+        + f'<text x="504" y="482" font-family="ui-monospace, \'SF Mono\', Menlo, monospace" font-size="28" fill="{CYAN}">github.com/dominusmaster/rea-gui</text>'),
 }
 for name, text in files.items():
     (OUT / name).write_text(text)
