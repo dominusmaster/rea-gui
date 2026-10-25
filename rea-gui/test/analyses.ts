@@ -1,17 +1,17 @@
 // Saved analyses survive a GUI restart, and one app keeps only its latest analysis.
-import { spawn } from "node:child_process";
+import { spawn , type ChildProcess } from "node:child_process";
 import { mkdtempSync, readdirSync, rmSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { fileURLToPath } from "node:url";
 import assert from "node:assert/strict";
+import { type Json, sleep, pageToken, apiClient } from "./helpers.ts";
 
 const port = 4597;
-const bin = fileURLToPath(new URL("../bin/rea-gui.mjs", import.meta.url));
-const fake = fileURLToPath(new URL("./fake-mcp.mjs", import.meta.url));
+const bin = fileURLToPath(new URL("../dist/bin/rea-gui.js", import.meta.url));
+const fake = fileURLToPath(new URL("./fake-mcp.ts", import.meta.url));
 const dataDir = mkdtempSync(join(tmpdir(), "rea-gui-analyses-"));
 const base = `http://127.0.0.1:${port}`;
-const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
 
 async function launch() {
   const child = spawn(process.execPath, [bin, "--port", String(port), "--no-open"], {
@@ -23,15 +23,14 @@ async function launch() {
     await sleep(100);
     html = await fetch(base).then((r) => r.text()).catch(() => null);
   }
-  const token = html.match(/name="rea-gui-token" content="([0-9a-f]+)"/)[1];
-  const api = (path, init = {}) =>
-    fetch(base + path, { ...init, headers: { "x-rea-gui-token": token, "content-type": "application/json" } }).then(async (r) => ({ status: r.status, body: await r.json() }));
+  const token = pageToken(html);
+  const api = apiClient(base, token);
   return { child, api };
 }
-const stop = (child) => new Promise((r) => (child.once("exit", r), child.kill()));
+const stop = (child: ChildProcess) => new Promise((r) => (child.once("exit", r), child.kill()));
 
 const record = { name: "inspect_signature", arguments: {}, state: "done", result: { content: [{ type: "text", text: JSON.stringify({ normalized_result: { signed: true } }) }] } };
-const snapshot = (id, path, extra = {}) => ({ id, path, name: "X", kind: "mac-app", at: Date.now(), finishedAt: Date.now(), state: "done", reaSession: "old-1", detected: { path, exists: true }, steps: [{ id: "signature", status: "done", record }], ...extra });
+const snapshot = (id: string, path: string, extra = {}) => ({ id, path, name: "X", kind: "mac-app", at: Date.now(), finishedAt: Date.now(), state: "done", reaSession: "old-1", detected: { path, exists: true }, steps: [{ id: "signature", status: "done", record }], ...extra });
 
 let server = await launch();
 try {
@@ -48,7 +47,7 @@ try {
   server = await launch();
   api = server.api;
   const list = (await api("/api/analyses")).body.analyses;
-  assert.deepEqual(list.map((a) => a.id).sort(), ["a12345", "a22222"], "list survives restart");
+  assert.deepEqual(list.map((a: Json) => a.id).sort(), ["a12345", "a22222"], "list survives restart");
   assert.ok(!("steps" in list[0]), "list carries summaries only");
   const saved = (await api("/api/analyses/a12345")).body;
   assert.deepEqual(saved.steps[0].record, record, "results survive restart");
@@ -56,7 +55,7 @@ try {
 
   // Re-analyzing the same app replaces its previous analysis, file included.
   await api("/api/analyses/a55555", { method: "PUT", body: JSON.stringify(snapshot("a55555", "/Apps/X.app")) });
-  assert.deepEqual((await api("/api/analyses")).body.analyses.map((a) => a.id).sort(), ["a22222", "a55555"]);
+  assert.deepEqual((await api("/api/analyses")).body.analyses.map((a: Json) => a.id).sort(), ["a22222", "a55555"]);
   assert.equal((await api("/api/analyses/a12345")).status, 404);
 
   assert.equal((await api("/api/analyses/a22222", { method: "DELETE" })).status, 200);

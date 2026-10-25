@@ -3,34 +3,45 @@
 import { mkdir, readFile, rename, rm, writeFile } from "node:fs/promises";
 import { join } from "node:path";
 
+/** A saved analysis: the browser's snapshot, kept as-is. */
+export interface AnalysisSnapshot {
+  id: string;
+  path: string;
+  at: number;
+  [key: string]: unknown;
+}
+export type AnalysisSummary = Record<(typeof SUMMARY_KEYS)[number], unknown> & { id: string; path: string; at: number };
+
 const ID = /^a[0-9a-z]{4,24}$/;
 const KEEP = 50;
-const SUMMARY_KEYS = ["id", "path", "name", "kind", "at", "state", "finishedAt", "failedChecks"];
+const SUMMARY_KEYS = ["id", "path", "name", "kind", "at", "state", "finishedAt", "failedChecks"] as const;
 
 export class AnalysisStore {
-  constructor(dir) {
+  dir: string;
+  index: AnalysisSummary[] | null = null;
+  // Writes run one at a time so the index never loses an update.
+  queue: Promise<unknown> = Promise.resolve();
+
+  constructor(dir: string) {
     this.dir = dir;
-    this.index = null;
-    // Writes run one at a time so the index never loses an update.
-    this.queue = Promise.resolve();
   }
 
-  static validId(id) {
+  static validId(id: unknown): id is string {
     return typeof id === "string" && ID.test(id);
   }
 
-  async list() {
+  async list(): Promise<AnalysisSummary[]> {
     if (!this.index) {
       try {
-        this.index = JSON.parse(await readFile(join(this.dir, "index.json"), "utf8"));
+        this.index = JSON.parse(await readFile(join(this.dir, "index.json"), "utf8")) as AnalysisSummary[];
       } catch {
         this.index = [];
       }
     }
-    return this.index;
+    return this.index ?? [];
   }
 
-  async get(id) {
+  async get(id: unknown): Promise<AnalysisSnapshot | null> {
     if (!AnalysisStore.validId(id)) return null;
     try {
       return JSON.parse(await readFile(this.file(id), "utf8"));
@@ -39,9 +50,9 @@ export class AnalysisStore {
     }
   }
 
-  save(snapshot) {
+  save(snapshot: AnalysisSnapshot): Promise<AnalysisSummary> {
     return this.serial(async () => {
-      const summary = Object.fromEntries(SUMMARY_KEYS.map((k) => [k, snapshot[k] ?? null]));
+      const summary = Object.fromEntries(SUMMARY_KEYS.map((k) => [k, snapshot[k] ?? null])) as AnalysisSummary;
       await mkdir(this.dir, { recursive: true });
       await atomicWrite(this.file(snapshot.id), JSON.stringify(snapshot));
       // A path keeps only its latest analysis, newest first.
@@ -56,7 +67,7 @@ export class AnalysisStore {
     });
   }
 
-  remove(id) {
+  remove(id: string): Promise<boolean> {
     return this.serial(async () => {
       const index = await this.list();
       if (!index.some((s) => s.id === id)) return false;
@@ -67,11 +78,11 @@ export class AnalysisStore {
     });
   }
 
-  file(id) {
+  file(id: string): string {
     return join(this.dir, `${id}.json`);
   }
 
-  serial(task) {
+  serial<T>(task: () => Promise<T>): Promise<T> {
     const run = this.queue.then(task);
     this.queue = run.catch(() => {});
     return run;
@@ -79,7 +90,7 @@ export class AnalysisStore {
 }
 
 // Write to a temp file first so a crash mid-write never leaves a truncated result.
-async function atomicWrite(path, text) {
+async function atomicWrite(path: string, text: string): Promise<void> {
   const tmp = `${path}.${process.pid}.tmp`;
   await writeFile(tmp, text);
   await rename(tmp, path);

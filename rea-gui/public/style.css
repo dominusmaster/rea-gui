@@ -623,7 +623,16 @@ dialog::backdrop { background: rgb(0 0 0 / 0.5); }
 .chat-header { margin-bottom: 16px; }
 .chat-header h1 { font-size: 20px; line-height: 28px; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
 .chat-header p { margin: 0; }
-.chat-settings { display: grid; grid-template-columns: repeat(auto-fit, minmax(220px, 1fr)); gap: 16px; margin-top: 16px; padding: 16px; border: 1px solid var(--border); border-radius: calc(var(--radius) + 4px); box-shadow: var(--shadow-sm); }
+.chat-settings-box { margin-top: 16px; border: 1px solid var(--border); border-radius: calc(var(--radius) + 4px); box-shadow: var(--shadow-sm); }
+.chat-settings-summary { display: flex; align-items: center; gap: 12px; padding: 10px 16px; min-height: 44px; cursor: pointer; list-style: none; font-size: 14px; color: var(--muted-foreground); border-radius: calc(var(--radius) + 4px); }
+.chat-settings-summary::-webkit-details-marker { display: none; }
+.chat-settings-summary:hover { background: var(--accent); }
+.chat-settings-summary .grow { overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+.chat-settings-summary strong { color: var(--foreground); font-weight: 500; }
+.chat-settings-summary .badge { flex-shrink: 0; }
+.chat-settings-toggle { flex-shrink: 0; color: var(--foreground); font-weight: 500; text-decoration: underline; text-underline-offset: 2px; }
+.chat-settings { display: grid; grid-template-columns: repeat(auto-fit, minmax(220px, 1fr)); gap: 16px; padding: 16px; border-top: 1px solid var(--border); }
+.chat-settings-actions { grid-column: 1 / -1; display: flex; justify-content: flex-end; }
 .chat-field { display: flex; flex-direction: column; gap: 6px; font-size: 14px; font-weight: 500; }
 .chat-field small { font-weight: 400; font-size: 12px; }
 .chat-field a { color: inherit; text-decoration: underline; text-underline-offset: 2px; }
@@ -739,6 +748,7 @@ main > * { margin-left: max(0px, calc((100cqw - 1200px) / 2)) !important; }
   .row-between .filter { flex: 1 1 100%; max-width: none; }
   .app-grid { grid-template-columns: minmax(0, 1fr); }
   .chat-settings { grid-template-columns: minmax(0, 1fr); padding: 12px; }
+  .chat-settings-summary .badge { display: none; }
   .chat-layout { height: calc(100vh - 56px - 56px); }
 }
 
@@ -918,12 +928,16 @@ main > * { margin-left: max(0px, calc((100cqw - 1200px) / 2)) !important; }
 .app-context-label .grow { overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
 .app-context-label .badge { font-weight: 400; flex-shrink: 0; }
 .app-context .tool-item { min-height: 30px; padding: 4px 8px; font-size: 13px; }
+/* Hierarchy: the app, then its overview one step in, then its tools one step further under a guide line. */
+.app-context > .nav-item, .app-context > .app-context-setup { margin-left: 16px; }
+.app-context-tools { display: grid; gap: 1px; margin-left: 28px; padding-left: 8px; border-left: 1px solid var(--border); }
 .app-context .tool-item.unavailable { color: var(--muted-foreground); }
 .app-context .tool-item.unavailable::after { content: none; }
 .app-context-setup > summary { list-style: none; cursor: pointer; padding: 6px 8px; font-size: 12px; color: var(--muted-foreground); border-radius: calc(var(--radius) - 2px); }
 .app-context-setup > summary::-webkit-details-marker { display: none; }
 .app-context-setup > summary:hover { background: var(--accent); color: var(--foreground); }
 .app-context .section-label { margin-top: 12px; }
+.app-context > .app-context-label { margin-top: 0; }
 .history-item { font-size: 13px; gap: 8px; }
 .history-item .grow { overflow: hidden; text-overflow: ellipsis; }
 .history-item .state { width: 14px; text-align: center; color: var(--muted-foreground); flex-shrink: 0; }

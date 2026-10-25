@@ -5,16 +5,16 @@ import assert from "node:assert/strict";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { request } from "node:http";
+import { type Json, sleep, pageToken, apiClient } from "./helpers.ts";
 
 const port = 4599;
-const bin = fileURLToPath(new URL("../bin/rea-gui.mjs", import.meta.url));
-const fake = fileURLToPath(new URL("./fake-mcp.mjs", import.meta.url));
+const bin = fileURLToPath(new URL("../dist/bin/rea-gui.js", import.meta.url));
+const fake = fileURLToPath(new URL("./fake-mcp.ts", import.meta.url));
 const child = spawn(process.execPath, [bin, "--port", String(port), "--no-open"], {
   env: { ...process.env, REA_BIN: fake, REA_NODE: process.execPath, REA_GUI_DATA_DIR: join(tmpdir(), `rea-gui-smoke-${process.pid}`) },
   stdio: ["ignore", "pipe", "inherit"],
 });
 const base = `http://127.0.0.1:${port}`;
-const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
 
 try {
   let html;
@@ -22,9 +22,8 @@ try {
     await sleep(100);
     html = await fetch(base).then((r) => r.text()).catch(() => null);
   }
-  const token = html.match(/name="rea-gui-token" content="([0-9a-f]+)"/)[1];
-  const api = (path, init = {}) =>
-    fetch(base + path, { ...init, headers: { "x-rea-gui-token": token, "content-type": "application/json" } }).then(async (r) => ({ status: r.status, body: await r.json() }));
+  const token = pageToken(html);
+  const api = apiClient(base, token);
 
   assert.equal((await fetch(`${base}/api/status`)).status, 401, "token required");
   const rebound = await new Promise((resolve) =>
@@ -43,7 +42,7 @@ try {
 
   // REA has one open file. Calls racing to open and inspect different apps must each see their own app.
   for (let i = 0; i < 50 && !(await api("/api/session")).body.session; i++) await sleep(50);
-  const finish = async (callId) => {
+  const finish = async (callId: string) => {
     for (let i = 0; i < 100; i++) {
       const r = (await api(`/api/calls/${callId}`)).body;
       if (r.state !== "running") return r;
@@ -51,7 +50,7 @@ try {
     }
     throw new Error("call did not finish");
   };
-  const post = (body) => api("/api/call", { method: "POST", body: JSON.stringify(body) }).then((r) => r.body.callId);
+  const post = (body: Json) => api("/api/call", { method: "POST", body: JSON.stringify(body) }).then((r) => r.body.callId);
   const [openA, sigB, sigA] = await Promise.all([
     post({ name: "open_binary", arguments: { path: "/Apps/A.app" } }),
     post({ name: "inspect_signature", arguments: {}, target: "/Apps/B.app" }),

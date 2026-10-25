@@ -1,0 +1,14 @@
+{
+  // Tests run as .ts straight through Node's type stripping, so this only type-checks them.
+  "extends": "./tsconfig.json",
+  "compilerOptions": {
+    "noEmit": true,
+    "allowImportingTsExtensions": true,
+    "erasableSyntaxOnly": true,
+    "lib": ["ES2023"],
+    "module": "NodeNext",
+    "moduleResolution": "NodeNext",
+    "types": ["node"]
+  },
+  "include": ["test/**/*.ts", "scripts/**/*.ts"]
+}

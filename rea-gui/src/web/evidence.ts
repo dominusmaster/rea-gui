@@ -1,12 +1,12 @@
 // Readable rendering for REA Evidence envelopes and their analysis views.
-// ctx: { h, jsonTree, callAndWait(name, args) -> record, viewTool }
+import type { EvidenceContext, H, JsonTree, ReaData } from "/dom.js";
 
-export function isEvidence(value) {
+export function isEvidence(value: ReaData) {
   return Boolean(value && typeof value === "object" && typeof value.evidence_id === "string" && "normalized_result" in value);
 }
 
 // Which inspect_analysis_view variants apply to each parent operation.
-const OPERATION_VIEWS = {
+const OPERATION_VIEWS: Record<string, { kind?: string; dim?: string; only?: string[]; facts?: string[] }[]> = {
   analyze_javascript_application: [
     {
       facts: ["ipc-channel", "ipc-handler", "context-bridge-api", "browser-window", "electron-main", "electron-preload", "endpoint", "storage", "native-addon", "worker"],
@@ -26,7 +26,7 @@ const OPERATION_VIEWS = {
 
 const PAGE_LIMIT = 50;
 
-const FACT_LABELS = {
+const FACT_LABELS: Record<string, string> = {
   "ipc-channel": "IPC channels",
   "ipc-handler": "IPC handlers",
   "context-bridge-api": "APIs exposed to web pages",
@@ -38,12 +38,12 @@ const FACT_LABELS = {
   "native-addon": "Native addons",
   worker: "Workers",
 };
-const VIEW_LABELS = { modules: "All modules", load_commands: "Load commands", build_metadata: "Build info", entrypoints: "Entry points" };
+const VIEW_LABELS: Record<string, string> = { modules: "All modules", load_commands: "Load commands", build_metadata: "Build info", entrypoints: "Entry points" };
 
 // Flatten the view schema's nested oneOf into { kind -> properties }.
-export function viewVariants(viewTool) {
-  const variants = {};
-  const visit = (schema) => {
+export function viewVariants(viewTool: ReaData) {
+  const variants: Record<string, ReaData> = {};
+  const visit = (schema: ReaData) => {
     if (!schema || typeof schema !== "object") return;
     for (const option of schema.oneOf ?? schema.anyOf ?? []) visit(option);
     const kind = schema.properties?.kind?.const;
@@ -53,15 +53,15 @@ export function viewVariants(viewTool) {
   return variants;
 }
 
-function enumOf(schema) {
+function enumOf(schema: ReaData) {
   if (!schema) return [];
   if (schema.enum) return schema.enum;
   if (schema.const !== undefined) return [schema.const];
   return [];
 }
 
-function buildView(variant, kind, dim, value, offset = 0) {
-  const view = { kind };
+function buildView(variant: ReaData, kind: string, dim: string | undefined, value: ReaData, offset = 0) {
+  const view: Record<string, unknown> = { kind };
   if (dim) view[dim] = value;
   if (variant.offset) view.offset = offset;
   if (variant.limit) view.limit = PAGE_LIMIT;
@@ -69,12 +69,12 @@ function buildView(variant, kind, dim, value, offset = 0) {
   return view;
 }
 
-const short = (text, n = 12) => (typeof text === "string" && text.length > n + 6 ? `${text.slice(0, n)}…` : text);
-const capitalize = (text) => text.charAt(0).toUpperCase() + text.slice(1);
-const label = (key) => key.replace(/[_-]/g, " ");
-const isPrimitive = (v) => v === null || ["string", "number", "boolean"].includes(typeof v);
+const short = (text: string, n = 12) => (typeof text === "string" && text.length > n + 6 ? `${text.slice(0, n)}…` : text);
+const capitalize = (text: string) => text.charAt(0).toUpperCase() + text.slice(1);
+const label = (key: string) => key.replace(/[_-]/g, " ");
+const isPrimitive = (v: ReaData) => v === null || ["string", "number", "boolean"].includes(typeof v);
 
-export function renderEvidence(ev, ctx) {
+export function renderEvidence(ev: ReaData, ctx: EvidenceContext) {
   const { h, jsonTree } = ctx;
   const nr = ev.normalized_result ?? {};
   const parentId = nr.parent_evidence_id ?? ev.evidence_id;
@@ -114,7 +114,7 @@ export function renderEvidence(ev, ctx) {
   if (rows && nr.kind === "javascript-facts") {
     // A single-kind filter makes the kind column redundant.
     const singleKind = nr.view?.where?.kinds?.length === 1;
-    rows = rows.map((row) => {
+    rows = rows.map((row: ReaData) => {
       const flat = flattenFact(row);
       if (singleKind) delete flat.kind;
       return flat;
@@ -141,7 +141,7 @@ export function renderEvidence(ev, ctx) {
   const limitations = [...new Set([...(nr.limitations ?? []), ...(ev.limitations ?? [])])];
   const unknowns = nr.unknowns ?? [];
   if (limitations.length) root.append(listSection(h, `Limitations (${limitations.length})`, limitations));
-  if (unknowns.length) root.append(listSection(h, `Unknowns (${unknowns.length})`, unknowns.map((u) => (isPrimitive(u) ? String(u) : JSON.stringify(u)))));
+  if (unknowns.length) root.append(listSection(h, `Unknowns (${unknowns.length})`, unknowns.map((u: ReaData) => (isPrimitive(u) ? String(u) : JSON.stringify(u)))));
 
   root.append(
     h("details", { class: "ev-raw" }, h("summary", { text: "Full Evidence record" }), jsonTree(ev, 1)),
@@ -149,28 +149,28 @@ export function renderEvidence(ev, ctx) {
   return root;
 }
 
-function coverageBadge(h, coverage) {
+function coverageBadge(h: H, coverage: ReaData) {
   const status = coverage.status ?? "unknown";
   const tone = /complete|exhausted/.test(status) ? "ok" : status === "page" ? "" : "warn";
   const counts = coverage.total != null ? ` · ${coverage.examined ?? "?"}/${coverage.total}` : "";
   return h("span", { class: `badge ${tone}`, title: JSON.stringify(coverage), text: `coverage ${status}${counts}` });
 }
 
-export const renderFacts = (h, jsonTree, value) => facts(h, jsonTree, value, 0);
+export const renderFacts = (h: H, jsonTree: JsonTree, value: ReaData) => facts(h, jsonTree, value, 0);
 
 // Android/Apple application inventory: counts, runtimes, then one table per component group.
-function appGraph(h, jsonTree, nr) {
-  const groups = Object.entries(nr.components).filter(([, list]) => Array.isArray(list));
-  const section = (title, body) => h("div", {}, h("div", { class: "section-label", text: title }), body);
-  const fileRows = (list) => list.map((c) => ({ path: c.path, format: c.format, sha256: short(c.sha256, 16), ...Object.fromEntries(Object.entries(c).filter(([k]) => !["path", "format", "sha256", "artifact_id"].includes(k))) }));
+function appGraph(h: H, jsonTree: JsonTree, nr: ReaData) {
+  const groups = Object.entries(nr.components as Record<string, unknown>).filter((entry): entry is [string, ReaData[]] => Array.isArray(entry[1]));
+  const section = (title: string, body: ReaData) => h("div", {}, h("div", { class: "section-label", text: title }), body);
+  const fileRows = (list: ReaData) => list.map((c: ReaData) => ({ path: c.path, format: c.format, sha256: short(c.sha256, 16), ...Object.fromEntries(Object.entries(c).filter(([k]) => !["path", "format", "sha256", "artifact_id"].includes(k))) }));
   return h(
     "div",
     { class: "facts" },
     h(
       "div",
       { class: "chips" },
-      ...(nr.platforms ?? [nr.root_format]).map((p) => h("span", { class: "badge accent", text: p })),
-      ...(nr.runtime_families ?? []).map((r) => h("span", { class: "badge", title: "Runtime family", text: r })),
+      ...(nr.platforms ?? [nr.root_format]).map((p: ReaData) => h("span", { class: "badge accent", text: p })),
+      ...(nr.runtime_families ?? []).map((r: ReaData) => h("span", { class: "badge", title: "Runtime family", text: r })),
     ),
     h(
       "div",
@@ -185,7 +185,7 @@ function appGraph(h, jsonTree, nr) {
 }
 
 // Render an object as stat tiles for scalar fields and subsections for nested ones.
-function facts(h, jsonTree, value, depth) {
+function facts(h: H, jsonTree: JsonTree, value: ReaData, depth: number) {
   if (isPrimitive(value)) return h("div", { class: "leaf-value", text: String(value) });
   if (Array.isArray(value)) {
     if (!value.length) return h("div", { class: "muted", text: "none" });
@@ -195,7 +195,7 @@ function facts(h, jsonTree, value, depth) {
   }
   const entries = Object.entries(value);
   // Short scalars become stat tiles; long strings (paths, digests) become key/value rows.
-  const isLong = (v) => typeof v === "string" && v.length > 28;
+  const isLong = (v: ReaData) => typeof v === "string" && v.length > 28;
   const scalars = entries.filter(([, v]) => isPrimitive(v) && !isLong(v));
   const longs = entries.filter(([, v]) => isLong(v));
   const nested = entries.filter(([, v]) => !isPrimitive(v));
@@ -213,7 +213,7 @@ function facts(h, jsonTree, value, depth) {
   }
   if (longs.length) {
     box.append(
-      h("dl", { class: "kv" }, ...longs.flatMap(([k, v]) => [h("dt", { text: label(k) }), h("dd", { text: v })])),
+      h("dl", { class: "kv" }, ...longs.flatMap(([k, v]) => [h("dt", { text: label(k) }), h("dd", { text: String(v) })])),
     );
   }
   for (const [k, v] of nested) {
@@ -227,7 +227,7 @@ function facts(h, jsonTree, value, depth) {
 }
 
 // One JavaScript fact row: its properties plus where and how confidently it was observed.
-function flattenFact(row) {
+function flattenFact(row: ReaData) {
   const location = row.evidence?.location?.value;
   const where = location?.source ? `${location.source}${location.start ? `:${location.start.line}:${location.start.column}` : ""}` : "";
   return {
@@ -239,7 +239,7 @@ function flattenFact(row) {
   };
 }
 
-function cellText(v) {
+function cellText(v: ReaData) {
   if (v === null || v === undefined) return "—";
   if (isPrimitive(v)) return String(v);
   if (Array.isArray(v) && v.every(isPrimitive)) return v.length ? v.join(", ") : "—";
@@ -247,26 +247,28 @@ function cellText(v) {
   return json.length > 160 ? `${json.slice(0, 160)}…` : json;
 }
 
-function simpleTable(h, rows, { onRow, jsonTree } = {}) {
-  const columns = [];
+function simpleTable(h: H, rows: ReaData[], { onRow, jsonTree }: { onRow?: ((row: ReaData) => void) | undefined; jsonTree?: JsonTree | undefined } = {}) {
+  const columns: string[] = [];
   for (const row of rows.slice(0, 100)) for (const key of Object.keys(row)) if (!columns.includes(key)) columns.push(key);
   // Drop columns that carry no value in any row.
   for (let i = columns.length - 1; i >= 0; i--) {
-    if (columns.length > 1 && rows.every((r) => r[columns[i]] === null || r[columns[i]] === undefined)) columns.splice(i, 1);
+    const column = columns[i] ?? "";
+    if (columns.length > 1 && rows.every((r: ReaData) => r[column] === null || r[column] === undefined)) columns.splice(i, 1);
   }
-  let sortKey = null;
+  let sortKey: string | null = null;
   let sortDir = 1;
   const tbody = h("tbody");
   const draw = () => {
-    const sorted = sortKey ? [...rows].sort((a, b) => (cellText(a[sortKey]) > cellText(b[sortKey]) ? sortDir : -sortDir)) : rows;
+    const key = sortKey;
+    const sorted = key ? [...rows].sort((a, b) => (cellText(a[key]) > cellText(b[key]) ? sortDir : -sortDir)) : rows;
     tbody.replaceChildren(
-      ...sorted.map((row) =>
+      ...sorted.map((row: ReaData) =>
         h(
           "tr",
           {
             class: "clickable",
             title: onRow ? "Open" : "Show details",
-            onclick: (e) => {
+            onclick: (e: ReaData) => {
               if (onRow) return onRow(row);
               // Toggle an inline detail row with the complete record.
               const tr = e.currentTarget;
@@ -305,29 +307,29 @@ function simpleTable(h, rows, { onRow, jsonTree } = {}) {
   return h("div", { class: "table-wrap" }, h("table", { class: "data" }, thead, tbody));
 }
 
-function rowsTable(ctx, rows, { parentId, parentOp }) {
+function rowsTable(ctx: EvidenceContext, rows: ReaData[], { parentId, parentOp }: { parentId: string; parentOp: string }) {
   const { h } = ctx;
   // JavaScript modules can be opened individually by node_id.
   const onRow =
     parentOp === "analyze_javascript_application" && rows[0]?.node_id
-      ? (row) =>
+      ? (row: ReaData) =>
           ctx.drill(`module ${row.path ?? row.node_id}`, {
             source: { kind: "retained-evidence", evidence_id: parentId },
             view: { kind: "item", collection: "modules", selector: { node_id: row.node_id } },
           })
-      : null;
+      : undefined;
   const wrap = h("div");
   wrap.append(h("div", { class: "section-label", text: `${rows.length} ${rows.length === 1 ? "row" : "rows"} · click a row to ${onRow ? "open it" : "see details"}` }));
   wrap.append(rows.length ? simpleTable(h, rows, { onRow, jsonTree: ctx.jsonTree }) : h("div", { class: "muted", text: "No rows" }));
   return wrap;
 }
 
-function exploreButtons(ctx, parentId, parentOp) {
+function exploreButtons(ctx: EvidenceContext, parentId: string, parentOp: string) {
   const { h } = ctx;
   const plans = OPERATION_VIEWS[parentOp];
   if (!plans || !ctx.viewTool) return null;
   const variants = viewVariants(ctx.viewTool);
-  const buttons = [];
+  const buttons: HTMLElement[] = [];
   const factButtons = [];
   for (const plan of plans) {
     if (plan.facts) {
@@ -347,9 +349,11 @@ function exploreButtons(ctx, parentId, parentOp) {
       }
       continue;
     }
-    const variant = variants[plan.kind];
+    if (!plan.kind) continue;
+    const kind = plan.kind;
+    const variant = variants[kind];
     if (!variant) continue;
-    const values = enumOf(variant[plan.dim]).filter((v) => !plan.only || plan.only.includes(v));
+    const values = enumOf(plan.dim ? variant[plan.dim] : undefined).filter((v: ReaData) => !plan.only || plan.only.includes(v));
     for (const value of values) {
       buttons.push(
         h("button", {
@@ -358,7 +362,7 @@ function exploreButtons(ctx, parentId, parentOp) {
           onclick: () =>
             ctx.drill(VIEW_LABELS[value] ?? capitalize(label(String(value))), {
               source: { kind: "retained-evidence", evidence_id: parentId },
-              view: buildView(variant, plan.kind, plan.dim, value),
+              view: buildView(variant, kind, plan.dim, value),
             }),
         }),
       );
@@ -375,38 +379,38 @@ function exploreButtons(ctx, parentId, parentOp) {
 }
 
 // Explore buttons for one Evidence record, for callers that render their own summary.
-export function exploreFor(ctx, ev) {
+export function exploreFor(ctx: EvidenceContext, ev: ReaData) {
   const nr = ev.normalized_result ?? {};
   return exploreButtons(ctx, nr.parent_evidence_id ?? ev.evidence_id, nr.parent_operation ?? ev.operation);
 }
 
-function listSection(h, title, items) {
+function listSection(h: H, title: string, items: ReaData) {
   return h(
     "details",
     { class: "ev-list" },
     h("summary", { text: title }),
-    h("ul", {}, ...items.slice(0, 500).map((item) => h("li", { text: item }))),
+    h("ul", {}, ...items.slice(0, 500).map((item: ReaData) => h("li", { text: item }))),
   );
 }
 
 // A drill-down panel: runs inspect_analysis_view and supports paging via coverage.next_offset.
-export function drillPanel(ctx, title, args) {
+export function drillPanel(ctx: EvidenceContext, title: string, args: ReaData) {
   const { h } = ctx;
   const panel = h("div", { class: "drill card" });
-  const load = async (initialArgs) => {
+  const load = async (initialArgs: ReaData) => {
     let viewArgs = initialArgs;
     panel.replaceChildren(h("div", { class: "drill-head" }, h("strong", { text: title }), h("span", { class: "muted", text: " loading…" })));
     let record = await ctx.callAndWait("inspect_analysis_view", viewArgs);
     // javascript-facts needs exact property names: discover them, then read their values.
     if (viewArgs.view.kind === "javascript-facts" && viewArgs.view.include_available_property_keys && !record.result?.isError) {
-      const discovered = JSON.parse(record.result.content.find((c) => c.type === "text").text);
-      const keys = [...new Set((discovered.normalized_result?.rows ?? []).flatMap((r) => r.available_property_keys ?? []))];
+      const discovered = JSON.parse(record.result.content.find((c: ReaData) => c.type === "text").text);
+      const keys = [...new Set((discovered.normalized_result?.rows ?? []).flatMap((r: ReaData) => r.available_property_keys ?? []))];
       if (keys.length) {
         viewArgs = { ...viewArgs, view: { ...viewArgs.view, property_keys: keys, include_available_property_keys: false } };
         record = await ctx.callAndWait("inspect_analysis_view", viewArgs);
       }
     }
-    const text = record.result?.content?.find((c) => c.type === "text")?.text;
+    const text = record.result?.content?.find((c: ReaData) => c.type === "text")?.text;
     let parsed;
     try {
       parsed = JSON.parse(text);

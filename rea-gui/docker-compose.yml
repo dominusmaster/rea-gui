@@ -9,6 +9,10 @@ services:
       REA_GUI_PASSWORD: ${REA_GUI_PASSWORD:?Set REA_GUI_PASSWORD in .env or the environment}
       # Optional: chat keys on the server, so users don't paste their own.
       ANTHROPIC_API_KEY: ${ANTHROPIC_API_KEY:-}
+      OPENAI_API_KEY: ${OPENAI_API_KEY:-}
+      GEMINI_API_KEY: ${GEMINI_API_KEY:-}
+      XAI_API_KEY: ${XAI_API_KEY:-}
+      DEEPSEEK_API_KEY: ${DEEPSEEK_API_KEY:-}
       OPENROUTER_API_KEY: ${OPENROUTER_API_KEY:-}
     volumes:
       - rea-gui-data:/data

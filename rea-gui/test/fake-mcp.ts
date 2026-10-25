@@ -1,6 +1,7 @@
 // Fake MCP stdio server used by the smoke test; argv[2] is ignored ("mcp").
 import { createInterface } from "node:readline";
-const send = (m) => process.stdout.write(`${JSON.stringify(m)}\n`);
+import type { Json } from "./helpers.ts";
+const send = (m: Json) => process.stdout.write(`${JSON.stringify(m)}\n`);
 const tools = [
   {
     name: "inspect_desktop_application",
@@ -14,8 +15,8 @@ const tools = [
   { name: "binary_session", description: "Session state", inputSchema: { type: "object", properties: {} } },
   { name: "inspect_signature", description: "Signature of the open file", inputSchema: { type: "object", properties: {} } },
 ];
-let open = null;
-const reply = (id, result, delay = 0) => setTimeout(() => send({ jsonrpc: "2.0", id, result: { content: [{ type: "text", text: JSON.stringify(result) }], structuredContent: result } }), delay);
+let open: string | null = null;
+const reply = (id: string, result: Json, delay = 0) => setTimeout(() => send({ jsonrpc: "2.0", id, result: { content: [{ type: "text", text: JSON.stringify(result) }], structuredContent: result } }), delay);
 createInterface({ input: process.stdin }).on("line", (line) => {
   const msg = JSON.parse(line);
   if (msg.method === "initialize") send({ jsonrpc: "2.0", id: msg.id, result: { protocolVersion: msg.params.protocolVersion, capabilities: { tools: {} }, serverInfo: { name: "fake-rea", version: "0.0.0" } } });
@@ -34,7 +35,7 @@ createInterface({ input: process.stdin }).on("line", (line) => {
     const targetTool = { names: ["inspect_signature"], available: Boolean(open), reason: open ? "available" : "target_required" };
     reply(msg.id, { result: { open: Boolean(open), path: open, format: "mach-o", tool_availability: { groups: [targetTool] } } });
   } else if (msg.method === "tools/call" && msg.params.name === "inspect_signature") {
-    if (!open) return reply(msg.id, { error: "no target" });
+    if (!open) return void reply(msg.id, { error: "no target" });
     const seen = open;
     reply(msg.id, { signed_path: seen }, 100);
   } else if (msg.method === "tools/call") {

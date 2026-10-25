@@ -4,17 +4,20 @@
   "description": "Visual interface for REA (Reverse Engineer Anything): guided app analysis, chat and every REA tool, locally or on a server.",
   "type": "module",
   "bin": {
-    "rea-gui": "bin/rea-gui.mjs"
+    "rea-gui": "dist/bin/rea-gui.js"
   },
   "files": [
-    "bin",
-    "lib",
-    "public"
+    "dist"
   ],
   "scripts": {
-    "start": "node bin/rea-gui.mjs",
-    "smoke": "node test/smoke.mjs",
-    "test": "node test/smoke.mjs && node test/chat.mjs && node test/analyses.mjs && node test/server.mjs"
+    "build": "rm -rf dist && tsc -p tsconfig.server.json && tsc -p tsconfig.web.json && node scripts/copy-public.ts",
+    "typecheck": "tsc -p tsconfig.server.json --noEmit && tsc -p tsconfig.web.json --noEmit && tsc -p tsconfig.test.json",
+    "prestart": "npm run build",
+    "start": "node dist/bin/rea-gui.js",
+    "smoke": "npm run build && node test/smoke.ts",
+    "pretest": "npm run typecheck && npm run build",
+    "test": "node test/smoke.ts && node test/chat.ts && node test/analyses.ts && node test/server.ts",
+    "prepack": "npm run build"
   },
   "dependencies": {
     "@anthropic-ai/sdk": "^1.1.0",
@@ -40,5 +43,9 @@
   "homepage": "https://github.com/dominusmaster/rea-gui#readme",
   "bugs": {
     "url": "https://github.com/dominusmaster/rea-gui/issues"
+  },
+  "devDependencies": {
+    "@types/node": "^26.6.4",
+    "typescript": "^7.0.2"
   }
 }

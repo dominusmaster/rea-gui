@@ -3,6 +3,10 @@
 // server, anyone who can load the page would get that token, so a password guards the page
 // itself and a session cookie proves the sign-in.
 import { randomBytes, scryptSync, timingSafeEqual } from "node:crypto";
+import type { IncomingMessage } from "node:http";
+import type { TLSSocket } from "node:tls";
+
+export type SignInResult = { ok: true; cookie: string } | { ok: false; status: number; error: string };
 
 const COOKIE = "rea_gui_session";
 const SESSION_DAYS = 30;
@@ -10,20 +14,21 @@ const MAX_FAILURES = 10; // per address, per window
 const FAILURE_WINDOW = 15 * 60 * 1000;
 
 export class PasswordAuth {
-  constructor(password) {
-    // Compare hashes, never the raw strings, so timing doesn't leak the password's length.
-    this.salt = randomBytes(16);
+  // Compare hashes, never the raw strings, so timing doesn't leak the password's length.
+  salt = randomBytes(16);
+  hash: Buffer;
+  sessions = new Map<string, number>(); // session id → expiry (ms)
+  failures = new Map<string, { count: number; since: number }>(); // address → failed sign-ins
+
+  constructor(password: string) {
     this.hash = scryptSync(password, this.salt, 32);
-    this.sessions = new Map(); // session id → expiry (ms)
-    this.failures = new Map(); // address → { count, since }
   }
 
-  check(password) {
+  check(password: unknown): boolean {
     return typeof password === "string" && timingSafeEqual(scryptSync(password, this.salt, 32), this.hash);
   }
 
-  // Returns { ok, cookie } on success, { ok: false, status, error } otherwise.
-  signIn(password, req) {
+  signIn(password: unknown, req: IncomingMessage): SignInResult {
     const address = clientAddress(req);
     const now = Date.now();
     const record = this.failures.get(address);
@@ -41,12 +46,13 @@ export class PasswordAuth {
     return { ok: true, cookie: cookie(id, SESSION_DAYS * 86400, isHttps(req)) };
   }
 
-  signOut(req) {
-    this.sessions.delete(sessionId(req));
+  signOut(req: IncomingMessage): string {
+    const id = sessionId(req);
+    if (id) this.sessions.delete(id);
     return cookie("", 0, isHttps(req));
   }
 
-  signedIn(req) {
+  signedIn(req: IncomingMessage): boolean {
     const id = sessionId(req);
     const expiry = id && this.sessions.get(id);
     if (!expiry) return false;
@@ -58,7 +64,7 @@ export class PasswordAuth {
   }
 }
 
-function sessionId(req) {
+function sessionId(req: IncomingMessage): string | null {
   for (const part of (req.headers.cookie ?? "").split(";")) {
     const [name, ...value] = part.trim().split("=");
     if (name === COOKIE) return value.join("=");
@@ -66,14 +72,14 @@ function sessionId(req) {
   return null;
 }
 
-function cookie(value, maxAge, secure) {
+function cookie(value: string, maxAge: number, secure: boolean): string {
   return `${COOKIE}=${value}; Path=/; HttpOnly; SameSite=Strict; Max-Age=${maxAge}${secure ? "; Secure" : ""}`;
 }
 
 // Behind a reverse proxy (the usual way to add HTTPS), the proxy says what the browser used.
-const isHttps = (req) => Boolean(req.socket.encrypted) || req.headers["x-forwarded-proto"] === "https";
+const isHttps = (req: IncomingMessage): boolean => Boolean((req.socket as TLSSocket).encrypted) || req.headers["x-forwarded-proto"] === "https";
 // X-Forwarded-For can be forged by any client, so it's only trusted when a proxy is declared.
-const clientAddress = (req) =>
-  (process.env.REA_GUI_TRUST_PROXY === "1" && String(req.headers["x-forwarded-for"] ?? "").split(",")[0].trim()) || req.socket.remoteAddress || "unknown";
+const clientAddress = (req: IncomingMessage): string =>
+  (process.env.REA_GUI_TRUST_PROXY === "1" && String(req.headers["x-forwarded-for"] ?? "").split(",")[0]?.trim()) || req.socket.remoteAddress || "unknown";
 
-export const isLoopback = (host) => ["127.0.0.1", "::1", "localhost"].includes(host);
+export const isLoopback = (host: string): boolean => ["127.0.0.1", "::1", "localhost"].includes(host);

@@ -1,21 +1,73 @@
 // REA GUI frontend. All target-derived text is rendered with textContent, never innerHTML.
 import { isEvidence, renderEvidence, drillPanel, renderFacts } from "/evidence.js";
-import { classify, KINDS, runAnalysis, restoreAnalysis } from "/analyze.js";
-const token = document.querySelector('meta[name="rea-gui-token"]').content;
+import { classify, KINDS, runAnalysis, restoreAnalysis, type Analysis } from "/analyze.js";
+import { h, $, $opt, errorMessage, type CallRecord, type Child, type EvidenceContext, type FieldEvent, type JsonTree, type Props, type ReaData, type Tool } from "/dom.js";
+const token = document.querySelector<HTMLMetaElement>('meta[name="rea-gui-token"]')?.content ?? "";
 // "server": REA GUI runs on another machine, so files are uploaded rather than picked from this computer.
-const serverMode = document.querySelector('meta[name="rea-gui-mode"]')?.content === "server";
-const passwordAuth = document.querySelector('meta[name="rea-gui-auth"]')?.content === "password";
-const $ = (sel) => document.querySelector(sel);
+const serverMode = document.querySelector<HTMLMetaElement>('meta[name="rea-gui-mode"]')?.content === "server";
+const passwordAuth = document.querySelector<HTMLMetaElement>('meta[name="rea-gui-auth"]')?.content === "password";
 const main = $("#main");
 
-const state = {
+/** The server's status event. */
+interface Status {
+  state: "starting" | "ready" | "failed" | "stopped";
+  error: string | null;
+  serverInfo: { name?: string; version?: string } | null;
+  protocolVersion: string | null;
+  toolCount: number;
+  reaSession: string;
+  launch: string;
+  guiVersion: string;
+}
+
+/** What REA's binary_session says, as the server summarizes it. */
+interface Session {
+  open: boolean;
+  target: { path: string; format?: string; kind?: string; architecture?: string; sha256?: string } | null;
+  providers: { id: string; name: string; status: string; code: string | null; reason: string | null }[];
+  binding: ReaData;
+  availability: Record<string, { available: boolean; reason?: string; remediation?: string }>;
+}
+
+interface InstalledApp {
+  name: string;
+  path: string;
+  kind: "desktop" | "electron";
+  analyzePath: string;
+}
+
+/** A tool run kept in the sidebar's history. */
+interface HistoryItem {
+  callId: string;
+  name: string;
+  args: ReaData;
+  at: number;
+  state: string;
+  app?: string | null;
+}
+
+const state: {
+  status: Status | null;
+  tools: Tool[];
+  apps: InstalledApp[] | null;
+  current: { callId: string; name: string; startedAt?: number; resultEl: HTMLElement; timer?: ReturnType<typeof setInterval>; onDone?: (record: CallRecord) => void } | null;
+  progress: Map<string, ReaData>;
+  history: HistoryItem[];
+  pendingArgs: ReaData | null;
+  reopenCall: string | null;
+  autoRun: boolean;
+  session: Session | null;
+  hideUnavailable: boolean;
+  analyses: Analysis[];
+} = {
   status: null,
   tools: [],
   apps: null,
-  current: null, // { callId, name, startedAt }
+  current: null,
   progress: new Map(),
   history: JSON.parse(localStorage.getItem("rea-gui-history") ?? "[]"),
   pendingArgs: null,
+  reopenCall: null,
   autoRun: false,
   session: null,
   hideUnavailable: localStorage.getItem("rea-gui-hide-unavailable") === "1",
@@ -24,8 +76,8 @@ const state = {
 };
 const waiters = new Map();
 // Evidence produced in this session, newest first: { id, label }.
-const recentEvidence = [];
-function rememberEvidence(ev) {
+const recentEvidence: { id: string; label: string }[] = [];
+function rememberEvidence(ev: ReaData) {
   const id = ev.normalized_result?.parent_evidence_id ?? ev.evidence_id;
   if (recentEvidence.some((e) => e.id === id)) return;
   recentEvidence.unshift({ id, label: `${ev.subject?.name ?? "evidence"} · ${ev.normalized_result?.parent_operation ?? ev.operation}` });
@@ -34,35 +86,26 @@ function rememberEvidence(ev) {
 
 // ---------- tiny DOM helper ----------
 // replaceChildren would render null as the text "null".
-const setMain = (...children) => {
-  main.replaceChildren(...children.filter((c) => c !== null && c !== undefined && c !== false));
+const setMain = (...children: Child[]) => {
+  const nodes: (Node | string)[] = [];
+  const add = (c: Child): void => {
+    if (c === null || c === undefined || c === false) return;
+    if (Array.isArray(c)) c.forEach(add);
+    else nodes.push(c instanceof Node ? c : String(c));
+  };
+  children.forEach(add);
+  main.replaceChildren(...nodes);
   main.scrollTop = 0; // a new page starts at its top, not at the previous page's offset
 };
 
-function h(tag, props = {}, ...children) {
-  const el = document.createElement(tag);
-  for (const [key, value] of Object.entries(props ?? {})) {
-    if (value === undefined || value === null || value === false) continue;
-    if (key === "class") el.className = value;
-    else if (key === "text") el.textContent = value;
-    else if (key.startsWith("on")) el.addEventListener(key.slice(2), value);
-    else if (key in el && typeof value !== "string") el[key] = value;
-    else el.setAttribute(key, value === true ? "" : value);
-  }
-  for (const child of children.flat()) {
-    if (child === null || child === undefined || child === false) continue;
-    el.append(child instanceof Node ? child : document.createTextNode(String(child)));
-  }
-  return el;
-}
-
-async function api(path, { method = "GET", body } = {}) {
+// Server responses are JSON whose shape depends on the endpoint.
+async function api(path: string, { method = "GET", body }: { method?: string; body?: unknown } = {}): Promise<ReaData> {
   let res;
   try {
     res = await fetch(path, {
       method,
       headers: { "x-rea-gui-token": token, ...(body ? { "content-type": "application/json" } : {}) },
-      body: body ? JSON.stringify(body) : undefined,
+      ...(body ? { body: JSON.stringify(body) } : {}),
     });
   } catch {
     setConnection("lost");
@@ -109,18 +152,18 @@ function renderStatus() {
 // ---------- connection to the REA GUI server ----------
 // "ok", "lost" (server unreachable; retried until it's back) or "restarted" (new token: the page must reload).
 let connection = "ok";
-let connectionPoll = null;
-function setConnection(next) {
+let connectionPoll: ReturnType<typeof setInterval> | undefined;
+function setConnection(next: ReaData) {
   if (connection === next || connection === "restarted") return;
   connection = next;
   clearInterval(connectionPoll);
   if (next === "lost") connectionPoll = setInterval(checkConnection, 3000);
   renderStatus();
 }
-async function checkConnection() {
+async function checkConnection(): Promise<void> {
   try {
     const res = await fetch("/api/status", { headers: { "x-rea-gui-token": token } });
-    if (res.status === 401 && (await res.json().catch(() => null))?.signIn) return (location.href = "/login.html");
+    if (res.status === 401 && (await res.json().catch(() => null))?.signIn) return void (location.href = "/login.html");
     setConnection(res.status === 401 ? "restarted" : "ok");
   } catch {
     setConnection("lost");
@@ -152,7 +195,7 @@ async function renderBanner() {
   } catch {}
   banner.replaceChildren(
     h("strong", { text: "REA could not start. " }),
-    h("span", { text: stderr.find((line) => /\b(Error|error)\b[:\s]|EACCES|ENOENT|not supported|unsupported/.test(line))?.trim() ?? state.status.error ?? "" }),
+    h("span", { text: stderr.find((line: string) => /\b(Error|error)\b[:\s]|EACCES|ENOENT|not supported|unsupported/.test(line))?.trim() ?? state.status?.error ?? "" }),
     h("pre", { text: stderr.slice(-12).join("\n") || "No output from REA." }),
     h(
       "div",
@@ -160,7 +203,7 @@ async function renderBanner() {
       h("button", { class: "primary", text: "Restart REA", onclick: () => api("/api/restart", { method: "POST" }) }),
       h("span", {
         class: "muted",
-        text: `Launch: ${state.status.launch}. Set REA_BIN to REA's scripts/rea.mjs and REA_NODE to Node 22.19+, 24.11+ or 26+ if needed, then relaunch rea-gui.`,
+        text: `Launch: ${state.status?.launch ?? "unknown"}. Set REA_BIN to REA's scripts/rea.mjs and REA_NODE to Node 22.19+, 24.11+ or 26+ if needed, then relaunch rea-gui.`,
       }),
     ),
   );
@@ -168,15 +211,15 @@ async function renderBanner() {
 }
 
 const logEl = $("#log");
-function appendLog(line) {
+function appendLog(line: string) {
   logEl.textContent += `${line}\n`;
   if (logEl.textContent.length > 200_000) logEl.textContent = logEl.textContent.slice(-150_000);
   logEl.scrollTop = logEl.scrollHeight;
 }
 
 // Resolves once REA's status (with the current run's ID) and, if REA is up, its tools are known.
-let statusKnown;
-const statusReady = new Promise((resolve) => (statusKnown = resolve));
+let statusKnown = () => {};
+const statusReady = new Promise<void>((resolve) => (statusKnown = resolve));
 
 function connectEvents() {
   const events = new EventSource(`/api/events?token=${token}`);
@@ -185,12 +228,13 @@ function connectEvents() {
   events.addEventListener("error", () => checkConnection());
   events.addEventListener("status", async (e) => {
     const previous = state.status?.state;
-    state.status = JSON.parse(e.data);
+    const status: Status = JSON.parse(e.data);
+    state.status = status;
     renderStatus();
-    if (state.status.state === "ready" && (previous !== "ready" || state.tools.length === 0)) {
+    if (status.state === "ready" && (previous !== "ready" || state.tools.length === 0)) {
       await loadTools();
     }
-    if (state.status.state !== "starting") statusKnown();
+    if (status.state !== "starting") statusKnown();
   });
   events.addEventListener("stderr", (e) => appendLog(JSON.parse(e.data)));
   events.addEventListener("log", (e) => {
@@ -210,7 +254,7 @@ function connectEvents() {
   events.addEventListener("call-finished", (e) => {
     const { callId, state: callState } = JSON.parse(e.data);
     waiters.get(callId)?.();
-    const entry = state.history.find((item) => item.callId === callId);
+    const entry = state.history.find((item: ReaData) => item.callId === callId);
     if (entry) {
       entry.state = callState;
       saveHistory();
@@ -225,7 +269,7 @@ async function loadTools() {
     state.session = session;
     renderSession();
   }
-  state.tools = tools.sort((a, b) => a.name.localeCompare(b.name));
+  state.tools = tools.sort((a: ReaData, b: ReaData) => a.name.localeCompare(b.name));
   renderToolList();
   // Pages drawn before the tool list arrived need redrawing.
   route(true);
@@ -234,10 +278,10 @@ async function loadTools() {
 // Run a tool without adding it to history. done resolves with the finished call record.
 const progressListeners = new Map();
 // target: the app this call is about; the server opens it first if REA has another file open.
-async function startCall(name, args, onProgress, target) {
+async function startCall(name: string, args: ReaData, onProgress?: (progress: ReaData) => void, target?: string): Promise<{ callId: string; done: Promise<CallRecord> }> {
   const { callId } = await api("/api/call", { method: "POST", body: { name, arguments: args, target } });
   if (onProgress) progressListeners.set(callId, onProgress);
-  const done = new Promise((resolve) => {
+  const done = new Promise<void>((resolve) => {
     waiters.set(callId, resolve);
     // The call may already have finished before the waiter was registered.
     api(`/api/calls/${callId}`).then((r) => r.state !== "running" && resolve()).catch(() => {});
@@ -248,15 +292,15 @@ async function startCall(name, args, onProgress, target) {
   });
   return { callId, done };
 }
-const callAndWait = async (name, args) => (await startCall(name, args)).done;
+const callAndWait = async (name: string, args: ReaData) => (await startCall(name, args)).done;
 
 // "target_required" only means nothing is open yet; the guided flows open the target themselves.
-const availabilityOf = (name) => {
+const availabilityOf = (name: string) => {
   const a = state.session?.availability?.[name] ?? null;
   return a?.reason === "target_required" ? { ...a, available: true } : a;
 };
-const toolExists = (name) => state.tools.some((t) => t.name === name);
-const usable = (name) => toolExists(name) && availabilityOf(name)?.available !== false;
+const toolExists = (name: string) => state.tools.some((t) => t.name === name);
+const usable = (name: string) => toolExists(name) && availabilityOf(name)?.available !== false;
 
 function renderSession() {
   const bar = $("#target");
@@ -275,18 +319,18 @@ function renderSession() {
 }
 
 // Suggested follow-ups once a target is open, filtered by what this machine can run.
-const NEXT_STEPS = [
-  ["inspect_macho", { detail: "summary" }, (t) => /mach-o/.test(t.format)],
-  ["inspect_signature", {}, (t) => /mach-o/.test(t.format)],
-  ["inspect_electron_fuses", (t) => ({ path: t.path }), (t) => /mach-o|pe|elf/.test(t.format)],
-  ["list_architectures", {}, (t) => /mach-o/.test(t.format)],
+const NEXT_STEPS: [string, ReaData | ((target: ReaData) => ReaData), (target: ReaData) => boolean][] = [
+  ["inspect_macho", { detail: "summary" }, (t: ReaData) => /mach-o/.test(t.format)],
+  ["inspect_signature", {}, (t: ReaData) => /mach-o/.test(t.format)],
+  ["inspect_electron_fuses", (t: ReaData) => ({ path: t.path }), (t: ReaData) => /mach-o|pe|elf/.test(t.format)],
+  ["list_architectures", {}, (t: ReaData) => /mach-o/.test(t.format)],
   ["inspect_artifact", { detail: "summary" }, () => true],
   ["binary_overview", {}, () => true],
-  ["inspect_managed_artifact", { detail: "summary" }, (t) => /pe/.test(t.format)],
+  ["inspect_managed_artifact", { detail: "summary" }, (t: ReaData) => /pe/.test(t.format)],
   ["close_binary", {}, () => true],
 ];
 
-function nextStepButtons(target) {
+function nextStepButtons(target: ReaData) {
   const steps = NEXT_STEPS.filter(([name, , when]) => usable(name) && when(target));
   if (!steps.length) return null;
   return h(
@@ -300,7 +344,7 @@ function nextStepButtons(target) {
 // ---------- sidebar ----------
 // The sidebar shows what applies to where you are. The full catalogue lives on the Tool library page.
 // Domain groups for the library, matched in order against tool names.
-const GROUPS = [
+const GROUPS: [string, RegExp][] = [
   ["Sessions & targets", /^(open_binary|close_binary|binary_session|binary_overview|inspect_desktop_application)$/],
   ["Android & devices", /adb|android|apk|jeb|dart|flutter|harmony/],
   ["Web & browser", /web|browser/],
@@ -315,7 +359,7 @@ const GROUPS = [
 
 // Static tools that inspect one app of each kind, in the order they're usually useful.
 // Live/runtime capture, evidence plumbing and two-input comparisons stay in the Tool library.
-const APP_TOOLS = {
+const APP_TOOLS: Record<string, string[]> = {
   electron: ["analyze_javascript_application", "inspect_electron_fuses", "inspect_signature", "inspect_macho", "list_architectures", "inspect_plist", "inspect_artifact", "extract_artifact", "recover_javascript_sources"],
   "mac-app": ["inspect_signature", "inspect_macho", "list_architectures", "trace_dylib_resolution", "inspect_plist", "inspect_asset_catalog", "decode_interface_builder", "list_strings", "inspect_artifact", "extract_artifact"],
   "mach-o": ["inspect_signature", "inspect_macho", "list_architectures", "trace_dylib_resolution", "inspect_binary_layout", "list_strings", "binary_overview"],
@@ -330,8 +374,8 @@ const APP_TOOLS = {
 };
 
 // "inspect_electron_fuses" → "Inspect electron fuses"; the raw name stays in the tooltip and search.
-const toolLabel = (name) => name.charAt(0).toUpperCase() + name.slice(1).replace(/_/g, " ");
-const toolBlocked = (name) => {
+const toolLabel = (name: string) => name.charAt(0).toUpperCase() + name.slice(1).replace(/_/g, " ");
+const toolBlocked = (name: string) => {
   const a = availabilityOf(name);
   return a?.available === false && !a.reason?.startsWith("target_") ? a : null;
 };
@@ -347,18 +391,18 @@ function currentApp() {
   if (!location.hash.startsWith("#/tool/") || !target) return null;
   const key = appKeyFor(target.path);
   const a = latestAnalysisFor(key);
-  const kind = a?.kind ?? (/\.app$/.test(key) ? "mac-app" : /apk/.test(target.format) ? "android" : /ipa/.test(target.format) ? "ios" : /mach-o/.test(target.format) ? "mach-o" : /^pe/.test(target.format) ? "windows" : /elf/.test(target.format) ? "elf" : "archive");
+  const kind = a?.kind ?? (/\.app$/.test(key) ? "mac-app" : /apk/.test(target.format ?? "") ? "android" : /ipa/.test(target.format ?? "") ? "ios" : /mach-o/.test(target.format ?? "") ? "mach-o" : /^pe/.test(target.format ?? "") ? "windows" : /elf/.test(target.format ?? "") ? "elf" : "archive");
   return { key, name: a?.name ?? fileName(key).replace(/\.app$/, ""), kind, analysisId: a?.id };
 }
 
 function renderToolList() {
-  const count = $("#tool-count");
+  const count = $opt("#tool-count");
   if (count) count.textContent = state.tools.length ? String(state.tools.length) : "";
   $("#nav-home").classList.toggle("active", ["", "#/", "#"].includes(location.hash));
   $("#nav-tools").classList.toggle("active", location.hash === "#/tools");
-  const chatNav = document.getElementById("nav-chat");
-  if (chatNav && !chatNav._wired) {
-    chatNav._wired = true;
+  const chatNav = document.querySelector<HTMLElement>("#nav-chat");
+  if (chatNav && !chatNav.dataset.wired) {
+    chatNav.dataset.wired = "1";
     chatNav.addEventListener("click", () => (location.hash = "#/chat"));
   }
   renderAppContext();
@@ -370,16 +414,16 @@ function renderAppContext() {
   const el = $("#app-context");
   const app = currentApp();
   if (!app || !state.tools.length) return el.replaceChildren();
-  const tools = (APP_TOOLS[app.kind] ?? APP_TOOLS.archive).map((name) => state.tools.find((t) => t.name === name)).filter(Boolean);
-  const ready = tools.filter((t) => !toolBlocked(t.name));
-  const setup = tools.filter((t) => toolBlocked(t.name));
-  const runs = state.history.filter((r) => r.app === app.key).slice(0, 5);
-  const toolButton = (t) =>
+  const tools = (APP_TOOLS[app.kind] ?? APP_TOOLS.archive ?? []).flatMap((name: string) => state.tools.find((t) => t.name === name) ?? []);
+  const ready = tools.filter((t: ReaData) => !toolBlocked(t.name));
+  const setup = tools.filter((t: ReaData) => toolBlocked(t.name));
+  const runs = state.history.filter((r: ReaData) => r.app === app.key).slice(0, 5);
+  const toolButton = (t: ReaData) =>
     h(
       "button",
       {
         class: `nav-item tool-item ${location.hash === `#/tool/${t.name}` ? "active" : ""} ${toolBlocked(t.name) ? "unavailable" : ""}`,
-        title: toolBlocked(t.name) ? `${t.name}\nNeeds setup: ${toolBlocked(t.name).remediation ?? toolBlocked(t.name).reason}` : t.name,
+        title: toolBlocked(t.name) ? `${t.name}\nNeeds setup: ${toolBlocked(t.name)?.remediation ?? toolBlocked(t.name)?.reason}` : t.name,
         // Tool pages act on REA's open file, so open this app first when it isn't the open one.
         onclick: () => openToolForApp(t.name, app),
       },
@@ -393,17 +437,19 @@ function renderAppContext() {
       app.analysisId
         ? h("button", { class: `nav-item ${location.hash === `#/analysis/${app.analysisId}` ? "active" : ""}`, onclick: () => (location.hash = `#/analysis/${app.analysisId}`) }, h("span", { text: "Overview" }))
         : h("button", { class: "nav-item", onclick: () => analyzePath(app.key) }, h("span", { text: "Run guided analysis" })),
-      ...ready.map(toolButton),
-      setup.length
-        ? h("details", { class: "app-context-setup" }, h("summary", { text: `${setup.length} more need setup` }), ...setup.map(toolButton))
-        : null,
+      h(
+        "div",
+        { class: "app-context-tools" },
+        ...ready.map(toolButton),
+        setup.length ? h("details", { class: "app-context-setup" }, h("summary", { text: `${setup.length} more need setup` }), ...setup.map(toolButton)) : null,
+      ),
       runs.length ? h("div", { class: "section-label", text: "Recent runs" }) : null,
       ...runs.map(historyButton),
     ),
   );
 }
 
-async function openToolForApp(name, app) {
+async function openToolForApp(name: string, app: ReaData) {
   const tool = state.tools.find((t) => t.name === name);
   const props = tool?.inputSchema?.properties ?? {};
   // Fill this app's path into the tool's path field; tools without one act on REA's open file.
@@ -448,22 +494,22 @@ function renderLibrary() {
 }
 
 function renderLibraryList() {
-  const list = $("#tool-list");
+  const list = $opt("#tool-list");
   if (!list) return;
-  const query = $("#tool-search").value.trim().toLowerCase();
+  const query = $<HTMLInputElement>("#tool-search").value.trim().toLowerCase();
   const matches = state.tools
     .filter((t) => !(state.hideUnavailable && toolBlocked(t.name)))
     .filter((t) => !query || t.name.includes(query) || toolLabel(t.name).toLowerCase().includes(query) || (t.description ?? "").toLowerCase().includes(query));
   const grouped = new Map();
   for (const tool of matches) {
-    const group = GROUPS.find(([, re]) => re.test(tool.name))[0];
+    const group = GROUPS.find(([, re]) => re.test(tool.name))?.[0] ?? "Other";
     if (!grouped.has(group)) grouped.set(group, []);
     grouped.get(group).push(tool);
   }
   list.replaceChildren(
     ...GROUPS.filter(([g]) => grouped.has(g)).map(([group]) => {
       const items = grouped.get(group);
-      const ready = items.filter((t) => !toolBlocked(t.name)).length;
+      const ready = items.filter((t: ReaData) => !toolBlocked(t.name)).length;
       const details = h(
         "details",
         { class: "library-group", open: Boolean(query) || openGroups.has(group) },
@@ -471,7 +517,7 @@ function renderLibraryList() {
         h(
           "div",
           { class: "library-rows" },
-          ...items.map((t) => {
+          ...items.map((t: ReaData) => {
             const blocked = toolBlocked(t.name);
             return h(
               "button",
@@ -502,8 +548,8 @@ function saveHistory() {
   renderAppContext();
 }
 
-function historyButton(item) {
-  const runIcon = { running: "◌", done: "✓", error: "✕" };
+function historyButton(item: ReaData) {
+  const runIcon: Record<string, string> = { running: "◌", done: "✓", error: "✕" };
   const target = Object.values(item.args ?? {}).find((v) => typeof v === "string") ?? "";
   return h(
     "button",
@@ -524,13 +570,13 @@ function historyButton(item) {
 }
 
 function renderHistory() {
-  const list = $("#history-list");
+  const list = $opt("#history-list");
   if (!list) return;
   list.replaceChildren(...(state.history.length ? state.history.map(historyButton) : [h("div", { class: "empty", text: "No tool runs yet." })]));
 }
 
 // ---------- routing ----------
-let lastRoute = null;
+let lastRoute: string | null = null;
 function route(force = false) {
   const hash = location.hash || "#/";
   if (hash === lastRoute && !force) return;
@@ -539,15 +585,15 @@ function route(force = false) {
   renderSession();
   renderAnalysisList();
   // Chat nav highlight
-  const chatNav = document.getElementById("nav-chat");
+  const chatNav = document.querySelector<HTMLElement>("#nav-chat");
   if (chatNav) chatNav.classList.toggle("active", hash === "#/chat");
   if (hash === "#/chat") return renderChat();
   if (hash === "#/tools") return renderLibrary();
   const analysisMatch = hash.match(/^#\/analysis\/(.+)$/);
-  if (analysisMatch) return renderAnalysisPage(analysisMatch[1]);
+  if (analysisMatch) return renderAnalysisPage(analysisMatch[1] ?? "");
   const toolMatch = hash.match(/^#\/tool\/(.+)$/);
   if (toolMatch) {
-    const tool = state.tools.find((t) => t.name === decodeURIComponent(toolMatch[1]));
+    const tool = state.tools.find((t) => t.name === decodeURIComponent(toolMatch[1] ?? ""));
     if (tool) return renderTool(tool);
     if (!state.tools.length) return main.replaceChildren(h("div", { class: "empty", text: "Waiting for REA to start…" }));
   }
@@ -555,26 +601,26 @@ function route(force = false) {
 }
 
 // ---------- home & guided analysis ----------
-function runQuick(name, args) {
+function runQuick(name: string, args: ReaData) {
   state.pendingArgs = args;
   state.autoRun = true;
   location.hash = `#/tool/${name}`;
   route(true);
 }
 
-const iconUrl = (path) => `/api/icon?token=${token}&app=${encodeURIComponent(path)}`;
+const iconUrl = (path: string) => `/api/icon?token=${token}&app=${encodeURIComponent(path)}`;
 const analysisDeps = {
   h,
   startCall,
-  cancelCall: (callId) => api(`/api/calls/${callId}/cancel`, { method: "POST" }).catch(() => {}),
+  cancelCall: (callId: string) => api(`/api/calls/${callId}/cancel`, { method: "POST" }).catch(() => {}),
   renderResult,
   evidenceCtx,
   toolExists,
   availabilityOf,
   iconUrl,
-  onChange: (analysis) => saveAnalysis(analysis),
-  rerun: (path) => analyzePath(path),
-  remove: (analysis) => removeAnalysis(analysis),
+  onChange: (analysis: ReaData) => saveAnalysis(analysis),
+  rerun: (path: string) => analyzePath(path),
+  remove: (analysis: ReaData) => removeAnalysis(analysis),
   reaSession: () => state.status?.reaSession ?? null,
 };
 
@@ -582,20 +628,27 @@ const analysisDeps = {
 // One chat panel per app, shared by its analysis page and every tool page while that app is open
 // in REA. The panel element is reused, so the conversation survives switching pages; "New chat"
 // starts another and History switches between them. Without an open app the panel is a general REA chat.
-const appChats = new Map(); // app key → { panel, ... }
+interface AppChat {
+  key: string;
+  chatId: string | null;
+  es: EventSource | null;
+  busy: boolean;
+  panel: HTMLElement;
+}
+const appChats = new Map<string, AppChat>(); // app key → its chat panel
 const savedChatIds = JSON.parse(sessionStorage.getItem("rea-app-chats") ?? "{}"); // app key → active chat id
 
 // Files inside a bundle belong to the bundle: ".../Ghostty.app/Contents/MacOS/ghostty" → ".../Ghostty.app".
-function appKeyFor(path) {
+function appKeyFor(path: string) {
   if (!path) return "general";
   return path.match(/^(.*?\.(?:app|ipa|apk|asar))(?:\/|$)/i)?.[1] ?? path;
 }
 
-function latestAnalysisFor(key) {
+function latestAnalysisFor(key: string) {
   return state.analyses.find((a) => appKeyFor(a.path) === key);
 }
 
-function appChatContext(key) {
+function appChatContext(key: string) {
   if (key === "general") {
     return "## This conversation\nNo app is open in REA GUI yet. Help the user pick and analyze one; any app or binary on this computer is in scope.";
   }
@@ -621,8 +674,8 @@ function appChatContext(key) {
   return lines.join("\n");
 }
 
-const fileName = (path) => path.replace(/\/+$/, "").split("/").pop();
-const SUGGESTIONS = {
+const fileName = (path: string): string => path.replace(/\/+$/, "").split("/").pop() ?? path;
+const SUGGESTIONS: Record<string, string[]> = {
   general: ["Which of my apps are built with Electron?", "What can REA do without extra setup?"],
   electron: ["Summarize the security risks", "What do the exposed APIs let web pages do?", "Which IPC channels look sensitive?"],
   "mac-app": ["What can this app access?", "Which libraries does it link?", "Is anything unusual about its signature?"],
@@ -630,7 +683,7 @@ const SUGGESTIONS = {
   ios: ["What frameworks does it bundle?", "Is it signed?"],
 };
 
-const relTime = (t) => {
+const relTime = (t: ReaData) => {
   const s = Math.round((Date.now() - t) / 1000);
   if (s < 60) return "just now";
   if (s < 3600) return `${Math.floor(s / 60)} min ago`;
@@ -638,7 +691,7 @@ const relTime = (t) => {
   return new Date(t).toLocaleDateString();
 };
 
-const icon = (paths) => {
+const icon = (paths: ReaData) => {
   const svg = document.createElementNS("http://www.w3.org/2000/svg", "svg");
   svg.setAttribute("viewBox", "0 0 24 24");
   svg.setAttribute("class", "icon");
@@ -651,12 +704,13 @@ const icon = (paths) => {
   return svg;
 };
 
-function appChat(key) {
-  if (appChats.has(key)) return appChats.get(key).panel;
+function appChat(key: string) {
+  const existing = appChats.get(key);
+  if (existing) return existing.panel;
   const general = key === "general";
   const name = general ? "REA" : latestAnalysisFor(key)?.name ?? fileName(key).replace(/\.app$/, "");
   const scope = `app:${key}`;
-  const c = { key, chatId: null, es: null, busy: false };
+  const c: AppChat = { key, chatId: null, es: null, busy: false, panel: null as unknown as HTMLElement };
 
   const messages = h("div", { class: "chat-messages" });
   const body = h("div", { class: "chat-body" }, messages);
@@ -668,7 +722,7 @@ function appChat(key) {
   const historyButton = h("button", { class: "ghost icon-button", type: "button", title: "Chat history", "aria-label": "Chat history", "aria-pressed": "false" }, icon(["M3 12a9 9 0 1 0 3-6.7L3 8", "M3 3v5h5", "M12 7v5l3 2"]));
   const newButton = h("button", { class: "ghost icon-button", type: "button", title: "New chat", "aria-label": "New chat" }, icon(["M12 5v14", "M5 12h14"]));
 
-  const setBusy = (value) => {
+  const setBusy = (value: ReaData) => {
     c.busy = value;
     send.textContent = value ? "Stop" : "Send";
     send.classList.toggle("primary", !value);
@@ -686,12 +740,12 @@ function appChat(key) {
         "div",
         { class: "analysis-chat-empty" },
         h("p", { class: "muted", text: general ? "Open a file in REA, or ask about any app on this computer. The assistant runs REA tools and asks before anything that changes state." : `Questions here stay on ${name}. The same chat follows you across this app's analysis and tool pages.` }),
-        h("div", { class: "chips" }, ...(SUGGESTIONS[kind] ?? SUGGESTIONS["mac-app"]).map((q) => h("button", { class: "ghost small", type: "button", text: q, onclick: () => ((prompt.value = q), submit()) }))),
+        h("div", { class: "chips" }, ...(SUGGESTIONS[kind ?? "mac-app"] ?? SUGGESTIONS["mac-app"] ?? []).map((q: string) => h("button", { class: "ghost small", type: "button", text: q, onclick: () => ((prompt.value = q), submit()) }))),
       ),
     );
   };
 
-  function connect(id) {
+  function connect(id: string | null) {
     c.es?.close();
     c.chatId = id;
     remember();
@@ -701,7 +755,7 @@ function appChat(key) {
     }
     const es = new EventSource(`/api/chat/sessions/${encodeURIComponent(id)}/stream?token=${token}`);
     c.es = es;
-    let view = null;
+    let view: ((event: ReaData) => void) | null = null;
     es.addEventListener("reset", (e) => {
       const data = JSON.parse(e.data);
       messages.replaceChildren();
@@ -715,7 +769,7 @@ function appChat(key) {
     es.onerror = () => {
       if (es.readyState === EventSource.CLOSED || c.es !== es) return;
       // The session is gone (server restarted): start fresh instead of reconnecting forever.
-      api("/api/chat/sessions").then(({ sessions }) => !sessions.some((s) => s.id === id) && c.chatId === id && connect(null)).catch(() => {});
+      api("/api/chat/sessions").then(({ sessions }) => !sessions.some((s: ReaData) => s.id === id) && c.chatId === id && connect(null)).catch(() => {});
     };
   }
 
@@ -731,14 +785,14 @@ function appChat(key) {
     keyRow.classList.remove("hidden");
     input.focus();
   };
-  const fail = (text) => {
+  const fail = (text: string) => {
     status.textContent = text;
     status.classList.remove("hidden");
   };
 
   async function submit() {
     if (c.busy) {
-      if (c.chatId) api(`/api/chat/sessions/${encodeURIComponent(c.chatId)}/abort`, { method: "POST" }).catch(() => {});
+      if (c.chatId) api(`/api/chat/sessions/${encodeURIComponent(c.chatId ?? "")}/abort`, { method: "POST" }).catch(() => {});
       return;
     }
     const text = prompt.value.trim();
@@ -750,20 +804,21 @@ function appChat(key) {
       showKeyField();
       return fail(`Add your ${chatProvider().keyLabel} to ask questions.`);
     }
-    if (chatState.provider === "openrouter" && !chatState.orModel) await loadOpenRouterModels();
-    if (chatSetupProblem()) return fail(chatSetupProblem());
+    if (!chatModel()) await loadModels();
+    const problem = chatSetupProblem();
+    if (problem) return fail(problem);
     try {
       if (!c.chatId) {
         // REA tools are needed here, so always use the REA assistant.
-        const agent = chatState.config.agents.find((a) => a.usesRea)?.id ?? chatState.agent;
+        const agent = chatState.config.agents.find((a: ReaData) => a.usesRea)?.id ?? chatState.agent;
         const sess = await api("/api/chat/sessions", { method: "POST", body: newChatBody({ agent, context: appChatContext(key), scope }) });
         keyRow.classList.add("hidden");
         connect(sess.id);
       }
       prompt.value = "";
-      await api(`/api/chat/sessions/${encodeURIComponent(c.chatId)}/message`, { method: "POST", body: { message: text, effort: chatState.effort } });
+      await api(`/api/chat/sessions/${encodeURIComponent(c.chatId ?? "")}/message`, { method: "POST", body: { message: text, effort: chatState.effort } });
     } catch (err) {
-      fail(err.message);
+      fail(errorMessage(err));
     }
   }
 
@@ -776,14 +831,14 @@ function appChat(key) {
     history.replaceChildren(h("p", { class: "muted small", text: "Loading…" }));
     let sessions = [];
     try {
-      sessions = (await api("/api/chat/sessions")).sessions.filter((s) => s.scope === scope);
+      sessions = (await api("/api/chat/sessions")).sessions.filter((s: ReaData) => s.scope === scope);
     } catch (err) {
-      return history.replaceChildren(h("p", { class: "chat-error-text", text: err.message }));
+      return history.replaceChildren(h("p", { class: "chat-error-text", text: errorMessage(err) }));
     }
     history.replaceChildren(
       h("div", { class: "app-chat-history-head" }, h("span", { text: general ? "Earlier chats" : `Earlier chats about ${name}` }), h("span", { class: "muted small", text: String(sessions.length) })),
       ...(sessions.length
-        ? sessions.map((s) =>
+        ? sessions.map((s: ReaData) =>
             h(
               "button",
               {
@@ -839,14 +894,14 @@ function appChat(key) {
   showEmpty();
   if (savedChatIds[key]) {
     api("/api/chat/sessions")
-      .then(({ sessions }) => sessions.some((s) => s.id === savedChatIds[key]) && !c.chatId && connect(savedChatIds[key]))
+      .then(({ sessions }) => sessions.some((s: ReaData) => s.id === savedChatIds[key]) && !c.chatId && connect(savedChatIds[key]))
       .catch(() => {});
   }
   return c.panel;
 }
 
 // Page content plus the app's chat: a docked column on wide screens, a drawer otherwise.
-function chatShell(content, key) {
+function chatShell(content: ReaData, key: string) {
   const shell = h("div", { class: "analysis-shell chat-shell", "data-chat-key": key }, content, appChat(key));
   shell.append(
     h(
@@ -856,7 +911,7 @@ function chatShell(content, key) {
         type: "button",
         onclick: () => {
           shell.classList.add("chat-open");
-          shell.querySelector(".app-chat .chat-prompt")?.focus();
+          shell.querySelector<HTMLElement>(".app-chat .chat-prompt")?.focus();
         },
       },
       icon(["M7.9 20A9 9 0 1 0 4 16.1L2 22Z"]),
@@ -867,10 +922,10 @@ function chatShell(content, key) {
 }
 
 // The analysis page reuses the shell; re-attach the shared panel if a tool page borrowed it.
-function withAnalysisChat(analysis) {
+function withAnalysisChat(analysis: ReaData) {
   analysis.page = chatShell(analysis.page, appKeyFor(analysis.path));
 }
-function attachChat(shell) {
+function attachChat(shell: ReaData) {
   const key = shell.dataset.chatKey;
   const panel = appChat(key);
   if (panel.parentElement !== shell) shell.insertBefore(panel, shell.querySelector(".chat-fab"));
@@ -878,13 +933,13 @@ function attachChat(shell) {
 
 // Tool pages follow whatever app is open in REA.
 function wrapToolPageWithChat() {
-  const key = appKeyFor(state.session?.target?.path);
+  const key = appKeyFor(state.session?.target?.path ?? "");
   main.replaceChildren(chatShell(h("div", { class: "chat-shell-content" }, ...main.childNodes), key));
 }
 function syncToolChat() {
-  const shell = main.querySelector(":scope > .chat-shell");
+  const shell = main.querySelector<HTMLElement>(":scope > .chat-shell");
   if (!shell || !location.hash.startsWith("#/tool/")) return;
-  const key = appKeyFor(state.session?.target?.path);
+  const key = appKeyFor(state.session?.target?.path ?? "");
   if (shell.dataset.chatKey === key) return;
   shell.dataset.chatKey = key;
   shell.querySelector(".app-chat")?.remove();
@@ -893,7 +948,7 @@ function syncToolChat() {
   if (label) label.textContent = key === "general" ? "Ask REA" : "Ask about this app";
 }
 
-function startAnalysis(detected, kind) {
+function startAnalysis(detected: ReaData, kind: string) {
   if (state.status?.state !== "ready") return alert("REA isn't running yet. Wait for the green status at the top, or press Restart REA.");
   const active = state.analyses.find((a) => a.path === detected.path && a.state === "running" && a.page);
   if (active) return (location.hash = `#/analysis/${active.id}`);
@@ -905,7 +960,7 @@ function startAnalysis(detected, kind) {
 }
 
 // XMLHttpRequest rather than fetch: it reports upload progress.
-function uploadFile(file, onProgress) {
+function uploadFile(file: File, onProgress: (fraction: number) => void): Promise<{ path: string; name: string; size: number }> {
   return new Promise((resolve, reject) => {
     const xhr = new XMLHttpRequest();
     xhr.open("POST", `/api/upload?name=${encodeURIComponent(file.name)}`);
@@ -920,7 +975,7 @@ function uploadFile(file, onProgress) {
   });
 }
 
-async function analyzePath(path) {
+async function analyzePath(path: string) {
   const detected = await api(`/api/detect?path=${encodeURIComponent(path)}`);
   const kind = classify(detected);
   if (kind) startAnalysis(detected, kind);
@@ -929,19 +984,19 @@ async function analyzePath(path) {
 
 // Writes for one analysis go out in order, and a newer snapshot replaces one still waiting.
 const analysisWrites = new Map(); // id → { running: Promise, next: snapshot | null }
-function saveAnalysis(analysis) {
+function saveAnalysis(analysis: ReaData) {
   state.analyses = [analysis, ...state.analyses.filter((a) => a !== analysis && a.path !== analysis.path)];
   renderAnalysisList();
   const { page, waiting, results, saveError, ...snapshot } = analysis;
   const slot = analysisWrites.get(analysis.id);
   if (slot) return void (slot.next = snapshot);
-  const write = async (body) => {
+  const write = async (body: ReaData) => {
     try {
       await api(`/api/analyses/${analysis.id}`, { method: "PUT", body });
       analysis.saveError = null;
     } catch (err) {
-      analysis.saveError = err.message;
-      console.warn(`Couldn't save analysis ${analysis.id}: ${err.message}`);
+      analysis.saveError = errorMessage(err);
+      console.warn(`Couldn't save analysis ${analysis.id}: ${errorMessage(err)}`);
     }
     const next = analysisWrites.get(analysis.id)?.next;
     if (next) {
@@ -954,7 +1009,7 @@ function saveAnalysis(analysis) {
   write(snapshot);
 }
 
-async function removeAnalysis(analysis) {
+async function removeAnalysis(analysis: ReaData) {
   await api(`/api/analyses/${analysis.id}`, { method: "DELETE" }).catch(() => {});
   state.analyses = state.analyses.filter((a) => a !== analysis);
   renderAnalysisList();
@@ -967,23 +1022,23 @@ const analysesLoaded = (async () => {
   try {
     const { analyses } = await api("/api/analyses");
     const live = state.analyses.filter((a) => a.page);
-    state.analyses = [...live, ...analyses.filter((s) => !live.some((a) => a.id === s.id || a.path === s.path))];
+    state.analyses = [...live, ...analyses.filter((s: ReaData) => !live.some((a) => a.id === s.id || a.path === s.path))];
   } catch (err) {
-    console.warn(`Couldn't load saved analyses: ${err.message}`);
+    console.warn(`Couldn't load saved analyses: ${errorMessage(err)}`);
   }
   renderAnalysisList();
 })();
 
 // A saved analysis still marked running, with no page running it here, was cut off (tab closed or reloaded).
 // A finished analysis with a failed check isn't shown as a clean success.
-const shownState = (a) => (a.state === "running" && !a.page ? "interrupted" : a.state === "done" && a.failedChecks ? "partial" : a.state);
+const shownState = (a: ReaData) => (a.state === "running" && !a.page ? "interrupted" : a.state === "done" && a.failedChecks ? "partial" : a.state);
 
 function renderAnalysisList() {
   const list = $("#analysis-list");
   list.replaceChildren();
   if (!state.analyses.length) list.append(h("div", { class: "empty", text: "No analyses yet" }));
-  const icon = { running: "◌", done: "✓", partial: "!", stopped: "■", interrupted: "■" };
-  const why = { partial: "Finished, but a check couldn't complete", interrupted: "Didn't finish", stopped: "Stopped" };
+  const icon: Record<string, string> = { running: "◌", done: "✓", partial: "!", stopped: "■", interrupted: "■" };
+  const why: Record<string, string> = { partial: "Finished, but a check couldn't complete", interrupted: "Didn't finish", stopped: "Stopped" };
   for (const a of state.analyses) {
     list.append(
       h(
@@ -997,7 +1052,7 @@ function renderAnalysisList() {
   }
 }
 
-async function renderAnalysisPage(id) {
+async function renderAnalysisPage(id: string) {
   await analysesLoaded;
   const analysis = state.analyses.find((a) => a.id === id);
   if (!analysis) return renderMissingAnalysis();
@@ -1013,7 +1068,7 @@ async function renderAnalysisPage(id) {
     if (location.hash !== `#/analysis/${id}`) return;
     return setMain(
       h("h1", { text: analysis.name }),
-      h("div", { class: "card" }, h("p", { class: "error-text", text: `Couldn't open the saved results: ${err.message}` }), h("button", { class: "primary", text: "Run analysis again", onclick: () => analyzePath(analysis.path) })),
+      h("div", { class: "card" }, h("p", { class: "error-text", text: `Couldn't open the saved results: ${errorMessage(err)}` }), h("button", { class: "primary", text: "Run analysis again", onclick: () => analyzePath(analysis.path) })),
     );
   }
   // Another click may have opened it meanwhile; keep one page per analysis.
@@ -1021,13 +1076,14 @@ async function renderAnalysisPage(id) {
   if (!current?.page) {
     // Drill-downs need REA's tool list and depend on its run ID; don't guess before both are known.
     await Promise.race([statusReady, new Promise((r) => setTimeout(r, 3000))]);
-    if (state.analyses.find((a) => a.id === id)?.page) return location.hash === `#/analysis/${id}` && setMain(state.analyses.find((a) => a.id === id).page);
+    const open = state.analyses.find((a) => a.id === id)?.page;
+    if (open) return location.hash === `#/analysis/${id}` && setMain(open);
     const restored = restoreAnalysis(analysisDeps, saved);
     withAnalysisChat(restored);
     state.analyses = state.analyses.map((a) => (a.id === id ? restored : a));
     renderAnalysisList();
   }
-  if (location.hash === `#/analysis/${id}`) setMain(state.analyses.find((a) => a.id === id).page);
+  if (location.hash === `#/analysis/${id}`) setMain(state.analyses.find((a) => a.id === id)?.page);
 }
 
 function renderMissingAnalysis() {
@@ -1037,9 +1093,9 @@ function renderMissingAnalysis() {
   );
 }
 
-const debounce = (fn, ms) => {
-  let t;
-  const debounced = (...args) => (clearTimeout(t), (t = setTimeout(() => fn(...args), ms)));
+const debounce = <A extends unknown[]>(fn: (...args: A) => unknown, ms: number) => {
+  let t: ReturnType<typeof setTimeout> | undefined;
+  const debounced = (...args: A) => (clearTimeout(t), (t = setTimeout(() => fn(...args), ms)));
   debounced.cancel = () => clearTimeout(t);
   return debounced;
 };
@@ -1048,13 +1104,13 @@ const SUPPORTED = "Mac apps · Electron apps · Android APK · iOS IPA · Window
 
 async function renderHome() {
   // The home page is redrawn when REA's tools arrive; keep whatever was already typed.
-  const typed = document.getElementById("target-path")?.value ?? "";
+  const typed = document.querySelector<HTMLInputElement>("#target-path")?.value ?? "";
   // A visible label and hint sit above the field. The button stays enabled and validates on press.
   const input = h("input", { id: "target-path", class: "big-input", spellcheck: false, autocomplete: "off", value: typed });
   const hint = h("div", { class: "detect-hint muted", "aria-live": "polite" });
   const go = h("button", { class: "primary big", text: "Start analysis" });
-  let pending = null;
-  const showError = (text) => {
+  let pending: { detected: ReaData; kind: string } | null = null;
+  const showError = (text: string) => {
     hint.className = "detect-hint error-text";
     hint.textContent = text;
     input.setAttribute("aria-invalid", "true");
@@ -1068,7 +1124,7 @@ async function renderHome() {
     try {
       detected = await api(`/api/detect?path=${encodeURIComponent(value)}`);
     } catch (err) {
-      return showError(err.message);
+      return showError(errorMessage(err));
     }
     if (input.value.trim() !== value) return;
     const kind = classify(detected);
@@ -1076,7 +1132,7 @@ async function renderHome() {
     if (!kind) return showError("This folder isn't an app. Choose the .app, .apk, .ipa or app.asar inside it.");
     pending = { detected, kind };
     hint.className = "detect-hint";
-    hint.replaceChildren(h("span", { class: "badge accent", text: KINDS[kind].label }), " ", h("span", { class: "muted", text: KINDS[kind].blurb }));
+    hint.replaceChildren(h("span", { class: "badge accent", text: KINDS[kind]?.label }), " ", h("span", { class: "muted", text: KINDS[kind]?.blurb }));
   };
   const check = debounce(runCheck, 200);
   input.addEventListener("input", check);
@@ -1094,20 +1150,21 @@ async function renderHome() {
   const grid = h("div", { class: "app-grid" }, h("div", { class: "empty", text: "Looking for installed apps…" }));
 
   // On a server, files come from this computer by upload (button or drag and drop).
-  const upload = async (file) => {
+  const upload = async (file: File | undefined) => {
+    if (!file) return;
     if (!file) return;
     hint.className = "detect-hint muted";
     hint.textContent = `Uploading ${file.name}…`;
     try {
-      const saved = await uploadFile(file, (fraction) => (hint.textContent = `Uploading ${file.name}… ${Math.round(fraction * 100)}%`));
+      const saved = await uploadFile(file, (fraction: number) => (hint.textContent = `Uploading ${file.name}… ${Math.round(fraction * 100)}%`));
       input.value = saved.path;
       await runCheck();
       if (pending) startAnalysis(pending.detected, pending.kind);
     } catch (err) {
-      showError(`Upload failed: ${err.message}`);
+      showError(`Upload failed: ${errorMessage(err)}`);
     }
   };
-  const fileInput = h("input", { type: "file", class: "hidden", onchange: (e) => upload(e.target.files[0]) });
+  const fileInput = h("input", { type: "file", class: "hidden", onchange: (e) => upload(e.target.files?.[0]) });
   const pickButtons = serverMode
     ? [h("button", { text: "Upload file", onclick: () => fileInput.click() }), h("button", { class: "ghost", text: "Browse server", title: "Pick a file that's already on the server", onclick: async () => ((input.value = (await pickPath(input.value)) ?? input.value), check()) })]
     : [h("button", { text: "Choose file", onclick: async () => ((input.value = (await pickPath(input.value)) ?? input.value), check()) })];
@@ -1128,7 +1185,7 @@ async function renderHome() {
   if (serverMode) {
     hero.addEventListener("dragover", (e) => (e.preventDefault(), hero.classList.add("drop")));
     hero.addEventListener("dragleave", () => hero.classList.remove("drop"));
-    hero.addEventListener("drop", (e) => (e.preventDefault(), hero.classList.remove("drop"), upload(e.dataTransfer.files[0])));
+    hero.addEventListener("drop", (e) => (e.preventDefault(), hero.classList.remove("drop"), upload(e.dataTransfer?.files[0])));
   }
 
   setMain(
@@ -1150,31 +1207,31 @@ async function renderHome() {
       state.apps = (await api("/api/apps")).apps;
     } catch (err) {
       state.apps = [];
-      grid.replaceChildren(h("div", { class: "empty", text: `Could not list apps: ${err.message}` }));
+      grid.replaceChildren(h("div", { class: "empty", text: `Could not list apps: ${errorMessage(err)}` }));
       return;
     }
   }
   const draw = () => {
     const q = filter.value.toLowerCase();
-    const apps = state.apps.filter((a) => !q || a.name.toLowerCase().includes(q));
+    const apps = (state.apps ?? []).filter((a: ReaData) => !q || a.name.toLowerCase().includes(q));
     grid.replaceChildren(
-      ...apps.map((app) =>
+      ...apps.map((app: ReaData) =>
         h(
           "button",
           { class: "app-card", title: `Analyze ${app.path}`, onclick: () => analyzePath(app.path) },
-          h("img", { class: "app-icon", loading: "lazy", alt: "", src: iconUrl(app.path), onerror: (e) => e.target.classList.add("missing") }),
+          h("img", { class: "app-icon", loading: "lazy", alt: "", src: iconUrl(app.path), onerror: (e: ReaData) => e.target.classList.add("missing") }),
           h("div", { class: "app-text" }, h("div", { class: "name", text: app.name }), h("div", { class: "type", text: app.kind === "electron" ? "Electron app" : "Mac app" })),
         ),
       ),
     );
-    if (!apps.length) grid.append(h("div", { class: "empty", text: state.apps.length ? "No apps match." : "No installed apps found. Paste a path above." }));
+    if (!apps.length) grid.append(h("div", { class: "empty", text: state.apps?.length ? "No apps match." : "No installed apps found. Paste a path above." }));
   };
   filter.addEventListener("input", draw);
   draw();
 }
 
 // Plain-language capability list: which kinds of analysis work here, and what to install otherwise.
-const CAPABILITIES = [
+const CAPABILITIES: [string, string[]][] = [
   ["App signatures, bundles and Mach-O binaries", ["inspect_signature", "inspect_macho", "inspect_artifact"]],
   ["JavaScript and Electron apps", ["analyze_javascript_application", "inspect_electron_fuses"]],
   ["Android app layout and Flutter", ["project_android_application_graph", "identify_flutter_build"]],
@@ -1188,7 +1245,7 @@ const CAPABILITIES = [
 ];
 
 function renderReadiness() {
-  const el = $("#readiness");
+  const el = $opt("#readiness");
   if (!el) return;
   const session = state.session;
   if (!session || !state.tools.length) return el.replaceChildren();
@@ -1196,10 +1253,10 @@ function renderReadiness() {
     const present = names.filter(toolExists);
     if (!present.length) return null;
     // target_* reasons describe the currently open file, not this machine.
-    const blocked = present.map((n) => [n, availabilityOf(n)]).find(([, a]) => a?.available === false && !a.reason?.startsWith("target_"));
-    return [label, blocked?.[1]];
-  }).filter(Boolean);
-  const nativeReady = session.providers.some((p) => p.status === "available");
+    const blocked = present.map((n) => [n, availabilityOf(n)] as const).find(([, a]) => a?.available === false && !a.reason?.startsWith("target_"));
+    return [label, blocked?.[1] ?? null] as [string, ReaData];
+  }).filter((row): row is [string, ReaData] => row !== null);
+  const nativeReady = session.providers.some((p: ReaData) => p.status === "available");
   rows.push(["Decompiling native code (pseudocode, cross-references)", nativeReady ? null : { reason: "no decompiler connected", remediation: "Install Hopper, Ghidra, IDA or Kuna and configure it for REA." }]);
   const ready = rows.filter(([, b]) => !b).length;
   el.replaceChildren(
@@ -1225,27 +1282,27 @@ function renderReadiness() {
 }
 
 // ---------- JSON schema → form ----------
-function resolveRef(schema, root) {
+function resolveRef(schema: ReaData, root: HTMLElement) {
   let s = schema;
   for (let i = 0; s?.$ref && i < 10; i++) {
     const path = s.$ref.replace(/^#\//, "").split("/");
-    s = path.reduce((node, key) => node?.[decodeURIComponent(key)], root);
+    s = path.reduce((node: ReaData, key: string) => node?.[decodeURIComponent(key)], root);
   }
   return s ?? {};
 }
 
-function describeField(schema, root) {
+function describeField(schema: ReaData, root: ReaData): ReaData {
   const s = resolveRef(schema, root);
   const variants = s.anyOf ?? s.oneOf;
   if (variants) {
-    const resolved = variants.map((v) => resolveRef(v, root));
-    const nonNull = resolved.filter((v) => v.type !== "null");
-    const literals = nonNull.flatMap((v) => (v.const !== undefined ? [v.const] : v.enum ?? [null]));
+    const resolved = variants.map((v: ReaData) => resolveRef(v, root));
+    const nonNull = resolved.filter((v: ReaData) => v.type !== "null");
+    const literals = nonNull.flatMap((v: ReaData) => (v.const !== undefined ? [v.const] : v.enum ?? [null]));
     if (literals.length && !literals.includes(null)) return { kind: "enum", options: literals, schema: s };
     if (nonNull.length === 1) return { ...describeField(nonNull[0], root), schema: { ...nonNull[0], ...s } };
     return { kind: "json", schema: s };
   }
-  const type = Array.isArray(s.type) ? s.type.find((t) => t !== "null") : s.type;
+  const type = Array.isArray(s.type) ? s.type.find((t: ReaData) => t !== "null") : s.type;
   if (s.enum) return { kind: "enum", options: s.enum, schema: s };
   if (s.const !== undefined) return { kind: "enum", options: [s.const], schema: s };
   if (type === "string") return { kind: "string", schema: s };
@@ -1260,7 +1317,7 @@ function describeField(schema, root) {
 }
 
 // A minimal valid-looking value for a schema: required keys, first variant, enum defaults.
-function skeleton(schema, root, depth = 0) {
+function skeleton(schema: ReaData, root: ReaData, depth = 0): unknown {
   const s = resolveRef(schema, root);
   if (depth > 4) return null;
   if (s.default !== undefined) return s.default;
@@ -1268,12 +1325,12 @@ function skeleton(schema, root, depth = 0) {
   if (s.enum) return s.enum[0];
   const variants = s.oneOf ?? s.anyOf;
   if (variants) {
-    const first = variants.map((v) => resolveRef(v, root)).find((v) => v.type !== "null") ?? variants[0];
+    const first = variants.map((v: ReaData) => resolveRef(v, root)).find((v: ReaData) => v.type !== "null") ?? variants[0];
     return skeleton(first, root, depth + 1);
   }
-  const type = Array.isArray(s.type) ? s.type.find((t) => t !== "null") : s.type;
+  const type = Array.isArray(s.type) ? s.type.find((t: ReaData) => t !== "null") : s.type;
   if (type === "object" || s.properties) {
-    const out = {};
+    const out: Record<string, unknown> = {};
     const required = s.required ?? [];
     for (const key of required) out[key] = skeleton(s.properties?.[key] ?? {}, root, depth + 1);
     return out;
@@ -1285,21 +1342,21 @@ function skeleton(schema, root, depth = 0) {
   return null;
 }
 
-const looksLikePath = (name) => /(^|_)(path|paths|file|dir|directory|root|input|output|asar|bundle|binary|apk)(_|$)/.test(name);
+const looksLikePath = (name: string) => /(^|_)(path|paths|file|dir|directory|root|input|output|asar|bundle|binary|apk)(_|$)/.test(name);
 
-function buildForm(tool) {
+function buildForm(tool: ReaData) {
   const root = tool.inputSchema ?? {};
   const props = root.properties ?? {};
   const required = new Set(root.required ?? []);
   const keys = Object.keys(props).sort((a, b) => Number(required.has(b)) - Number(required.has(a)));
-  const fields = [];
+  const fields: { key: string; el: HTMLElement; read: () => unknown; write: (v: ReaData) => void }[] = [];
 
   for (const key of keys) {
     const desc = describeField(props[key], root);
     const s = desc.schema;
-    let input;
-    let read;
-    let write;
+    let input: HTMLInputElement | HTMLSelectElement | HTMLTextAreaElement;
+    let read: () => unknown;
+    let write: (v: ReaData) => void;
     const placeholder = s.default !== undefined ? `default: ${JSON.stringify(s.default)}` : "";
     switch (desc.kind) {
       case "enum":
@@ -1307,10 +1364,10 @@ function buildForm(tool) {
           "select",
           {},
           h("option", { value: "", text: placeholder ? `(${placeholder})` : "(unset)" }),
-          ...desc.options.map((o) => h("option", { value: JSON.stringify(o), text: String(o) })),
+          ...desc.options.map((o: ReaData) => h("option", { value: JSON.stringify(o), text: String(o) })),
         );
         read = () => (input.value ? JSON.parse(input.value) : undefined);
-        write = (v) => (input.value = v === undefined ? "" : JSON.stringify(v));
+        write = (v: ReaData) => (input.value = v === undefined ? "" : JSON.stringify(v));
         break;
       case "boolean":
         input = h(
@@ -1321,26 +1378,26 @@ function buildForm(tool) {
           h("option", { value: "false", text: "false" }),
         );
         read = () => (input.value === "" ? undefined : input.value === "true");
-        write = (v) => (input.value = v === undefined ? "" : String(v));
+        write = (v: ReaData) => (input.value = v === undefined ? "" : String(v));
         break;
       case "number":
         input = h("input", { type: "number", placeholder, min: s.minimum, max: s.maximum, step: s.type === "integer" ? 1 : "any" });
         read = () => (input.value === "" ? undefined : Number(input.value));
-        write = (v) => (input.value = v ?? "");
+        write = (v: ReaData) => (input.value = v ?? "");
         break;
       case "string":
         input = h("input", { placeholder: placeholder || s.format || "", spellcheck: false });
         read = () => (input.value === "" ? undefined : input.value);
-        write = (v) => (input.value = v ?? "");
+        write = (v: ReaData) => (input.value = v ?? "");
         break;
       case "lines":
         input = h("textarea", { placeholder: "One value per line", rows: 3, spellcheck: false });
         read = () => {
-          const lines = input.value.split("\n").map((l) => l.trim()).filter(Boolean);
+          const lines = input.value.split("\n").map((l: ReaData) => l.trim()).filter(Boolean);
           if (!lines.length) return undefined;
           return desc.itemType === "string" ? lines : lines.map(Number);
         };
-        write = (v) => (input.value = Array.isArray(v) ? v.join("\n") : "");
+        write = (v: ReaData) => (input.value = Array.isArray(v) ? v.join("\n") : "");
         break;
       default: {
         const template = skeleton(props[key], root);
@@ -1355,7 +1412,7 @@ function buildForm(tool) {
             throw new Error(`${key}: invalid JSON`);
           }
         };
-        write = (v) => (input.value = v === undefined ? "" : JSON.stringify(v, null, 2));
+        write = (v: ReaData) => (input.value = v === undefined ? "" : JSON.stringify(v, null, 2));
       }
     }
 
@@ -1379,7 +1436,7 @@ function buildForm(tool) {
 
     const templateButton =
       input.dataset?.template
-        ? h("button", { type: "button", class: "link", text: "Insert template", onclick: () => (input.value = input.dataset.template) })
+        ? h("button", { type: "button", class: "link", text: "Insert template", onclick: () => (input.value = input.dataset.template ?? "") })
         : null;
     // Offer evidence from earlier results for fields that reference retained Evidence.
     const evidencePicker =
@@ -1390,7 +1447,7 @@ function buildForm(tool) {
               class: "evidence-picker",
               onchange: (e) => {
                 if (!e.target.value) return;
-                const value = JSON.parse(input.dataset.template.replace('"ev_…"', JSON.stringify(e.target.value)));
+                const value = JSON.parse((input.dataset.template ?? "").replace('"ev_…"', JSON.stringify(e.target.value)));
                 input.value = JSON.stringify(value, null, 2);
               },
             },
@@ -1424,21 +1481,21 @@ function buildForm(tool) {
   return {
     fields,
     read() {
-      const args = {};
+      const args: Record<string, unknown> = {};
       for (const f of fields) {
         const v = f.read();
         if (v !== undefined) args[f.key] = v;
       }
       return args;
     },
-    write(args = {}) {
+    write(args: Record<string, unknown> = {}) {
       for (const f of fields) f.write(args[f.key]);
     },
   };
 }
 
 // ---------- tool page ----------
-function renderTool(tool) {
+function renderTool(tool: ReaData) {
   const form = buildForm(tool);
   const raw = h("textarea", { rows: 12, spellcheck: false, class: "hidden" });
   const formEl = h("div", { class: "form" }, ...form.fields.map((f) => f.el));
@@ -1456,7 +1513,7 @@ function renderTool(tool) {
         if (!rawMode) raw.value = JSON.stringify(form.read(), null, 2);
         else form.write(JSON.parse(raw.value || "{}"));
       } catch (err) {
-        return alert(err.message);
+        return alert(errorMessage(err));
       }
       rawMode = !rawMode;
       raw.classList.toggle("hidden", !rawMode);
@@ -1472,7 +1529,7 @@ function renderTool(tool) {
     try {
       args = readArgs();
     } catch (err) {
-      return alert(err.message);
+      return alert(errorMessage(err));
     }
     runButton.disabled = true;
     try {
@@ -1480,19 +1537,19 @@ function renderTool(tool) {
       state.current = { callId, name: tool.name, startedAt: Date.now(), resultEl };
       // Runs belong to the app they act on: a path argument, else the file open in REA.
       const pathArg = Object.values(args).find((v) => typeof v === "string" && v.startsWith("/"));
-      const runApp = pathArg ? appKeyFor(pathArg) : state.session?.target ? appKeyFor(state.session.target.path) : null;
+      const runApp = typeof pathArg === "string" ? appKeyFor(pathArg) : state.session?.target ? appKeyFor(state.session.target.path) : null;
       state.history.unshift({ callId, name: tool.name, args, at: Date.now(), state: "running", app: runApp });
       saveHistory();
       renderRunning();
     } catch (err) {
-      resultEl.replaceChildren(h("pre", { class: "text-block error-box", text: err.message }));
+      resultEl.replaceChildren(h("pre", { class: "text-block error-box", text: errorMessage(err) }));
     } finally {
       runButton.disabled = false;
     }
   });
 
   const description = h("div", { class: "description collapsed", text: tool.description ?? "" });
-  const examples = (tool.inputSchema?.examples ?? tool._meta?.examples ?? []).filter((ex) => ex && Object.keys(ex).length);
+  const examples = (tool.inputSchema?.examples ?? tool._meta?.examples ?? []).filter((ex: ReaData) => ex && Object.keys(ex).length);
 
   setMain(
     h("h1", {}, h("code", { text: tool.name })),
@@ -1500,9 +1557,9 @@ function renderTool(tool) {
     availabilityOf(tool.name)?.available === false
       ? h("p", {
           class: "warning",
-          text: availabilityOf(tool.name).reason?.startsWith("target_")
-            ? `Doesn't apply to the file open in REA (${state.session?.target?.path.split("/").pop() ?? "none"}). ${availabilityOf(tool.name).remediation ?? ""}`
-            : `Needs setup on this machine. ${availabilityOf(tool.name).remediation ?? ""}`,
+          text: availabilityOf(tool.name)?.reason?.startsWith("target_")
+            ? `Doesn't apply to the file open in REA (${state.session?.target?.path.split("/").pop() ?? "none"}). ${availabilityOf(tool.name)?.remediation ?? ""}`
+            : `Needs setup on this machine. ${availabilityOf(tool.name)?.remediation ?? ""}`,
         })
       : null,
     tool.annotations?.destructiveHint && tool.annotations?.readOnlyHint === false
@@ -1515,7 +1572,7 @@ function renderTool(tool) {
           text: "Show full description",
           onclick: (e) => {
             description.classList.toggle("collapsed");
-            e.target.textContent = description.classList.contains("collapsed") ? "Show full description" : "Show less description";
+            (e.target as HTMLElement).textContent = description.classList.contains("collapsed") ? "Show full description" : "Show less description";
           },
         })
       : null,
@@ -1524,7 +1581,7 @@ function renderTool(tool) {
       ? h(
           "div",
           { class: "examples" },
-          ...examples.map((ex, i) =>
+          ...examples.map((ex: ReaData, i: number) =>
             h("button", {
               class: "ghost small",
               title: JSON.stringify(ex.input ?? ex, null, 2),
@@ -1561,6 +1618,7 @@ function renderTool(tool) {
 // ---------- results ----------
 function renderRunning() {
   const cur = state.current;
+  if (!cur) return;
   const cancel = h("button", {
     class: "ghost danger",
     text: "Cancel",
@@ -1569,7 +1627,7 @@ function renderRunning() {
   const elapsed = h("span", { class: "meta", text: "0s" });
   const timer = setInterval(() => {
     if (state.current !== cur) return clearInterval(timer);
-    elapsed.textContent = `${Math.round((Date.now() - cur.startedAt) / 1000)}s`;
+    elapsed.textContent = `${Math.round((Date.now() - (cur.startedAt ?? Date.now())) / 1000)}s`;
   }, 500);
   cur.timer = timer;
   cur.resultEl.replaceChildren(
@@ -1589,17 +1647,17 @@ function renderRunning() {
   if (p) updateProgress(p);
 }
 
-function updateProgress(p) {
-  const bar = $("#progress-bar");
-  const msg = $("#progress-message");
+function updateProgress(p: ReaData) {
+  const bar = $opt("#progress-bar");
+  const msg = $opt("#progress-message");
   if (msg) msg.textContent = p.message ?? (p.total ? `${p.progress}/${p.total}` : "");
   if (bar && p.total) {
     bar.classList.add("determinate");
-    bar.firstChild.style.width = `${Math.min(100, (p.progress / p.total) * 100)}%`;
+    (bar.firstChild as HTMLElement).style.width = `${Math.min(100, (p.progress / p.total) * 100)}%`;
   }
 }
 
-async function showCall(callId) {
+async function showCall(callId: string) {
   const cur = state.current;
   if (!cur || cur.callId !== callId) return;
   let record;
@@ -1618,7 +1676,7 @@ async function showCall(callId) {
   renderResult(cur.resultEl, record);
 }
 
-function renderResult(container, record) {
+function renderResult(container: HTMLElement, record: ReaData) {
   const duration = record.finishedAt && record.startedAt ? `${((record.finishedAt - record.startedAt) / 1000).toFixed(1)}s` : "";
   const failed = record.state === "error" || record.result?.isError;
   const payload = record.state === "error" ? { error: record.error } : record.result;
@@ -1652,9 +1710,9 @@ function renderResult(container, record) {
     readable.append(h("pre", { class: "text-block error-box", text: `${record.error.message}${record.error.data ? `\n\n${JSON.stringify(record.error.data, null, 2)}` : ""}` }));
   } else {
     const result = record.result ?? {};
-    const texts = (result.content ?? []).filter((c) => c.type === "text").map((c) => tryParse(c.text));
+    const texts = (result.content ?? []).filter((c: ReaData) => c.type === "text").map((c: ReaData) => tryParse(c.text));
     // Show structuredContent only when the text content doesn't already carry it.
-    if (result.structuredContent && !texts.some((t) => t !== undefined)) {
+    if (result.structuredContent && !texts.some((t: ReaData) => t !== undefined)) {
       readable.append(h("div", { class: "section-label", text: "Structured result" }), jsonTree(result.structuredContent, 2));
     }
     for (const item of result.content ?? []) {
@@ -1704,7 +1762,7 @@ function renderResult(container, record) {
 
 // REA errors carry a code, message and textual remediation such as
 // "rerun analyze_javascript_application with integrity_policy=record-and-continue".
-function errorCard(error, record) {
+function errorCard(error: ReaData, record: ReaData) {
   const remediation = error.remediation?.action ?? "";
   const card = h(
     "div",
@@ -1729,23 +1787,23 @@ function errorCard(error, record) {
   return card;
 }
 
-function evidenceCtx(drills) {
-  const ctx = {
+function evidenceCtx(drills: HTMLElement): EvidenceContext {
+  const ctx: EvidenceContext = {
     h,
     jsonTree,
     callAndWait,
     viewTool: state.tools.find((t) => t.name === "inspect_analysis_view"),
-    drill: (title, args) => {
+    drill: (title: string, args: ReaData) => {
       drills.prepend(drillPanel(ctx, title, args));
       drills.scrollIntoView({ behavior: "smooth", block: "start" });
     },
-    renderFailure: (record, parsed) =>
+    renderFailure: (record: ReaData, parsed: ReaData) =>
       parsed?.error ? errorCard(parsed.error, record) : h("pre", { class: "text-block error-box", text: record.error?.message ?? JSON.stringify(record.result ?? record, null, 2) }),
   };
   return ctx;
 }
 
-function tryParse(text) {
+function tryParse(text: string) {
   if (typeof text !== "string" || !/^\s*[[{]/.test(text)) return undefined;
   try {
     return JSON.parse(text);
@@ -1754,16 +1812,16 @@ function tryParse(text) {
   }
 }
 
-function formatBytes(n) {
+function formatBytes(n: number) {
   return n < 1024 ? `${n} B` : n < 1048576 ? `${(n / 1024).toFixed(1)} KB` : `${(n / 1048576).toFixed(1)} MB`;
 }
 
 // Collapsible JSON tree; children render lazily when a node is opened.
-function jsonTree(value, openDepth = 1) {
+function jsonTree(value: ReaData, openDepth = 1): HTMLElement {
   return h("div", { class: "tree" }, treeNode(null, value, 0, openDepth));
 }
 
-function leafValue(value) {
+function leafValue(value: ReaData) {
   if (value === null) return h("span", { class: "z", text: "null" });
   if (typeof value === "string") return h("span", { class: "s", text: JSON.stringify(value) });
   if (typeof value === "number") return h("span", { class: "n", text: String(value) });
@@ -1771,7 +1829,7 @@ function leafValue(value) {
   return h("span", { text: String(value) });
 }
 
-function treeNode(key, value, depth, openDepth) {
+function treeNode(key: string | null, value: ReaData, depth: number, openDepth: number) {
   const keyEl = key !== null ? [h("span", { class: "k", text: key }), ": "] : [];
   if (value === null || typeof value !== "object") return h("div", { class: "leaf" }, ...keyEl, leafValue(value));
   const isArray = Array.isArray(value);
@@ -1796,19 +1854,19 @@ function treeNode(key, value, depth, openDepth) {
 }
 
 // ---------- server-side path picker ----------
-async function pickPath(start) {
-  const dialog = $("#picker");
-  const pathInput = $("#picker-path");
+async function pickPath(start: string): Promise<string | null> {
+  const dialog = $<HTMLDialogElement>("#picker");
+  const pathInput = $<HTMLInputElement>("#picker-path");
   const itemsEl = $("#picker-items");
-  let current = null;
+  let current: { path: string; parent: string | null } | null = null;
 
-  const load = async (path) => {
+  const load = async (path: string) => {
     try {
       const listing = await api(`/api/fs?path=${encodeURIComponent(path ?? "")}`);
       current = listing;
       pathInput.value = listing.path;
       itemsEl.replaceChildren(
-        ...listing.items.map((item) =>
+        ...listing.items.map((item: ReaData) =>
           h("button", {
             type: "button",
             class: "nav-item",
@@ -1820,20 +1878,20 @@ async function pickPath(start) {
       );
       if (!listing.items.length) itemsEl.append(h("div", { class: "empty", text: "Empty folder" }));
     } catch (err) {
-      itemsEl.replaceChildren(h("div", { class: "empty", text: err.message }));
+      itemsEl.replaceChildren(h("div", { class: "empty", text: errorMessage(err) }));
     }
   };
 
-  let resolvePick;
-  const finish = (path) => {
+  let resolvePick = (_path: string | null) => {};
+  const finish = (path: string | null) => {
     dialog.close();
     resolvePick(path);
   };
-  const result = new Promise((resolve) => (resolvePick = resolve));
+  const result = new Promise<string | null>((resolve) => (resolvePick = resolve));
   $("#picker-up").onclick = () => current?.parent && load(current.parent);
   $("#picker-go").onclick = () => load(pathInput.value);
   pathInput.onkeydown = (e) => e.key === "Enter" && (e.preventDefault(), load(pathInput.value));
-  $("#picker-select").onclick = () => finish(current?.path);
+  $("#picker-select").onclick = () => finish(current?.path ?? null);
   dialog.onclose = () => resolvePick(null);
 
   const startDir = start?.trim() ? start.trim().replace(/\/[^/]*\.[^/]+$/, "") : "";
@@ -1850,22 +1908,73 @@ $("#toggle-log").addEventListener("click", () => $("#log-panel").classList.toggl
 $("#close-log").addEventListener("click", () => $("#log-panel").classList.add("hidden"));
 if (passwordAuth) $("#sign-out").classList.remove("hidden");
 $("#sign-out").addEventListener("click", () => fetch("/api/logout", { method: "POST" }).finally(() => location.replace("/login.html")));
-$("#restart").addEventListener("click", () => api("/api/restart", { method: "POST" }).catch((err) => alert(err.message)));
+$("#restart").addEventListener("click", () => api("/api/restart", { method: "POST" }).catch((err) => alert(errorMessage(err))));
 
 // ---------- Chat ----------
 // The server keeps each chat's event log; the browser rebuilds the transcript from it on every connect.
-const chatState = {
-  config: null, // { agents, providers, models, efforts, defaultEffort }
+interface ChatProvider {
+  id: string;
+  label: string;
+  keyLabel: string;
+  keyPlaceholder: string;
+  keyEnv: string;
+  keyUrl?: string;
+  serverKey?: boolean;
+}
+interface ChatModel {
+  id: string;
+  label: string;
+  vendor?: string;
+  note?: string;
+  reasoning?: boolean;
+}
+interface ChatConfig {
+  agents: { id: string; label: string; description: string; usesRea: boolean }[];
+  providers: ChatProvider[];
+  models: ChatModel[];
+  efforts: string[];
+  defaultEffort: string;
+  serverKey: boolean;
+}
+interface ChatSummary {
+  id: string;
+  provider: string;
+  agent: string;
+  model: string;
+  title: string | null;
+  busy: boolean;
+  createdAt: number;
+  scope: string | null;
+}
+
+const chatState: {
+  config: ChatConfig | null;
+  configError: string | null;
+  sessions: ChatSummary[];
+  active: string | null;
+  provider: string;
+  keys: Record<string, string>;
+  models: Record<string, string>;
+  catalogs: Record<string, ChatModel[]>;
+  catalogErrors: Record<string, string>;
+  settingsOpen: boolean | null;
+  agent: string | null;
+  effort: string | null;
+  busy: boolean;
+  es: EventSource | null;
+  view: ((event: ReaData) => void) | null;
+} = {
+  config: null,
   configError: null,
   sessions: [],
   active: sessionStorage.getItem("rea-chat-active"),
   provider: localStorage.getItem("rea-chat-provider") ?? "anthropic",
   // Keys and models are kept per provider, so switching back and forth loses nothing.
-  keys: { anthropic: localStorage.getItem("rea-chat-apikey") ?? "", openrouter: localStorage.getItem("rea-chat-openrouter-key") ?? "" },
-  model: localStorage.getItem("rea-chat-model"), // Anthropic model
-  orModel: localStorage.getItem("rea-chat-openrouter-model") ?? "",
-  orModels: null, // OpenRouter's tool-capable models, loaded on demand
-  orModelsError: null,
+  keys: {}, // provider → key, read lazily from localStorage
+  models: {}, // provider → chosen model id
+  catalogs: {}, // provider → its models, loaded on demand (Anthropic's come with the config)
+  catalogErrors: {},
+  settingsOpen: null, // null: open only until a key is saved
   agent: localStorage.getItem("rea-chat-agent"),
   effort: localStorage.getItem("rea-chat-effort"),
   busy: false,
@@ -1878,43 +1987,63 @@ async function loadChatConfig() {
     const cfg = await api("/api/chat/config");
     chatState.config = cfg;
     chatState.configError = null;
-    if (!cfg.models.some((m) => m.id === chatState.model)) chatState.model = cfg.models[0].id;
-    if (!cfg.providers?.some((p) => p.id === chatState.provider)) chatState.provider = "anthropic";
-    if (!cfg.agents.some((a) => a.id === chatState.agent)) chatState.agent = cfg.agents[0].id;
+    chatState.catalogs.anthropic = cfg.models;
+    if (!cfg.models.some((m: ReaData) => m.id === chatModel("anthropic"))) setChatModel(cfg.models[0].id, "anthropic");
+    if (!cfg.providers?.some((p: ReaData) => p.id === chatState.provider)) chatState.provider = "anthropic";
+    if (!cfg.agents.some((a: ReaData) => a.id === chatState.agent)) chatState.agent = cfg.agents[0].id;
     if (!cfg.efforts.includes(chatState.effort)) chatState.effort = cfg.defaultEffort;
   } catch (err) {
-    chatState.configError = err.message;
+    chatState.configError = errorMessage(err);
   }
 }
 
-const KEY_STORAGE = { anthropic: "rea-chat-apikey", openrouter: "rea-chat-openrouter-key" };
-const chatProvider = () => chatState.config?.providers?.find((p) => p.id === chatState.provider) ?? { id: "anthropic", keyLabel: "Anthropic API key", keyPlaceholder: "sk-ant-…", keyEnv: "ANTHROPIC_API_KEY", serverKey: chatState.config?.serverKey };
-const chatKey = () => chatState.keys[chatState.provider] ?? "";
+// Anthropic and OpenRouter keep the storage names they had before other providers arrived.
+const storageName = (provider: string, what: string) => (provider === "anthropic" ? (what === "key" ? "rea-chat-apikey" : "rea-chat-model") : `rea-chat-${provider}-${what}`);
+const chatProvider = (): ChatProvider => chatState.config?.providers?.find((p: ReaData) => p.id === chatState.provider) ?? { id: "anthropic", label: "Anthropic", keyLabel: "Anthropic API key", keyPlaceholder: "sk-ant-…", keyEnv: "ANTHROPIC_API_KEY", serverKey: chatState.config?.serverKey ?? false };
+const chatKey = (provider = chatState.provider) => (chatState.keys[provider] ??= localStorage.getItem(storageName(provider, "key")) ?? "");
 const hasChatKey = () => Boolean(chatKey() || chatProvider().serverKey);
-const chatModel = () => (chatState.provider === "openrouter" ? chatState.orModel : chatState.model);
-function setChatKey(value) {
+const chatModel = (provider = chatState.provider) => (chatState.models[provider] ??= localStorage.getItem(storageName(provider, "model")) ?? "");
+function setChatKey(value: ReaData) {
   chatState.keys[chatState.provider] = value.trim();
-  localStorage.setItem(KEY_STORAGE[chatState.provider], chatState.keys[chatState.provider]);
+  localStorage.setItem(storageName(chatState.provider, "key"), chatState.keys[chatState.provider] ?? "");
+}
+function setChatModel(id: string, provider = chatState.provider) {
+  chatState.models[provider] = id.trim();
+  localStorage.setItem(storageName(provider, "model"), chatState.models[provider]);
 }
 // What a new chat is created with; every chat (main page and per-app) uses the same settings.
 const newChatBody = (extra = {}) => ({ provider: chatState.provider, apiKey: chatKey(), model: chatModel(), ...extra });
-function chatModelLabel(session) {
-  if (session.provider === "openrouter") return `${chatState.orModels?.find((m) => m.id === session.model)?.label ?? session.model} via OpenRouter`;
-  return chatState.config?.models.find((m) => m.id === session.model)?.label ?? session.model;
+const providerLabel = (id: string) => chatState.config?.providers?.find((p: ReaData) => p.id === id)?.label ?? id;
+function modelLabel(provider: string, id: string) {
+  const m = chatState.catalogs[provider]?.find((x: ReaData) => x.id === id);
+  return m ? (provider === "openrouter" ? `${m.vendor} ${m.label}` : m.label) : id;
+}
+function chatModelLabel(session: ReaData) {
+  const label = modelLabel(session.provider, session.model);
+  return session.provider === "anthropic" ? label : `${label} via ${providerLabel(session.provider).replace(/ \(.*\)$/, "")}`;
 }
 
-// Strong tool-using defaults, in order; otherwise OpenRouter's auto router picks per request.
-const OPENROUTER_DEFAULTS = [/^anthropic\/claude-sonnet-5/, /^anthropic\/claude-opus-5/, /^anthropic\/claude-sonnet/, /^openai\/gpt-5/, /^google\/gemini-.*pro/];
-async function loadOpenRouterModels(refresh = false) {
+// Strong tool-using defaults, in order. Lists are searched newest version first.
+const MODEL_DEFAULTS: Record<string, RegExp[]> = {
+  openrouter: [/^anthropic\/claude-sonnet-5/, /^anthropic\/claude-opus-5/, /^anthropic\/claude-sonnet/, /^openai\/gpt-5/, /^google\/gemini-.*pro/],
+  openai: [/^gpt-5(\.\d+)?$/, /^gpt-5/, /^gpt-4\.1$/, /^o\d$/],
+  gemini: [/^gemini-[\d.]+-pro$/, /^gemini-[\d.]+-pro/, /^gemini-[\d.]+-flash$/],
+  xai: [/^grok-\d(\.\d)?$/, /^grok-\d/],
+  deepseek: [/^deepseek-chat$/, /^deepseek-/],
+};
+const newestFirst = (a: ReaData, b: ReaData) => b.id.localeCompare(a.id, "en", { numeric: true });
+async function loadModels(provider = chatState.provider, refresh = false) {
+  if (provider === "anthropic") return;
   try {
-    chatState.orModels = (await api("/api/chat/models", { method: "POST", body: { provider: "openrouter", apiKey: chatState.keys.openrouter, refresh } })).models;
-    chatState.orModelsError = null;
-    if (!chatState.orModel) {
-      const pick = OPENROUTER_DEFAULTS.map((re) => chatState.orModels.filter((m) => re.test(m.id)).sort((a, b) => b.id.localeCompare(a.id))[0]).find(Boolean);
-      chatState.orModel = pick?.id ?? "openrouter/auto";
+    const models = (await api("/api/chat/models", { method: "POST", body: { provider, apiKey: chatKey(provider), refresh } })).models;
+    chatState.catalogs[provider] = models;
+    delete chatState.catalogErrors[provider];
+    if (!chatModel(provider) || (models.length && !models.some((m: ReaData) => m.id === chatModel(provider)) && provider !== "openrouter")) {
+      const pick = (MODEL_DEFAULTS[provider] ?? []).map((re: RegExp) => models.filter((m: ReaData) => re.test(m.id)).sort(newestFirst)[0]).find(Boolean) ?? models[0];
+      if (pick || provider === "openrouter") setChatModel(pick?.id ?? "openrouter/auto", provider);
     }
   } catch (err) {
-    chatState.orModelsError = err.message;
+    chatState.catalogErrors[provider] = errorMessage(err);
   }
 }
 // Not having a key or model is reported in words the user can act on, wherever the chat is.
@@ -1927,21 +2056,21 @@ function chatSetupProblem() {
 async function loadChatSessions() {
   try {
     // Analysis chats live on their analysis page, not in the main chat list.
-    chatState.sessions = (await api("/api/chat/sessions")).sessions.filter((s) => !s.scope);
+    chatState.sessions = (await api("/api/chat/sessions")).sessions.filter((s: ReaData) => !s.scope);
   } catch {
     chatState.sessions = [];
   }
   if (chatState.active && !chatState.sessions.some((s) => s.id === chatState.active)) setActiveChat(null);
 }
 
-function setActiveChat(id) {
+function setActiveChat(id: string | null) {
   chatState.active = id;
   if (id) sessionStorage.setItem("rea-chat-active", id);
   else sessionStorage.removeItem("rea-chat-active");
 }
 
 // Minimal Markdown → DOM (no innerHTML): fenced code, headings, lists, quotes, paragraphs, inline code/bold/italic/links.
-function renderInline(text) {
+function renderInline(text: string) {
   const out = [];
   const re = /(`[^`]+`)|(\*\*[^*]+\*\*)|(\*[^*\s][^*]*\*)|(\[[^\]]+\]\((https?:\/\/[^)\s]+)\))/g;
   let last = 0;
@@ -1950,46 +2079,47 @@ function renderInline(text) {
     if (m[1]) out.push(h("code", { text: m[1].slice(1, -1) }));
     else if (m[2]) out.push(h("strong", { text: m[2].slice(2, -2) }));
     else if (m[3]) out.push(h("em", { text: m[3].slice(1, -1) }));
-    else out.push(h("a", { href: m[5], target: "_blank", rel: "noopener noreferrer", text: m[4].slice(1, m[4].indexOf("]")) }));
+    else out.push(h("a", { href: m[5], target: "_blank", rel: "noopener noreferrer", text: (m[4] ?? "").slice(1, (m[4] ?? "").indexOf("]")) }));
     last = m.index + m[0].length;
   }
   if (last < text.length) out.push(text.slice(last));
   return out;
 }
 
-function renderMarkdown(src) {
+function renderMarkdown(src: string) {
   const root = document.createDocumentFragment();
   const lines = src.replace(/\r\n/g, "\n").split("\n");
   let i = 0;
+  const at = (k: number): string => lines[k] ?? "";
   while (i < lines.length) {
-    const line = lines[i];
+    const line = at(i);
     if (/^```/.test(line)) {
-      const body = [];
+      const body: string[] = [];
       i++;
-      while (i < lines.length && !/^```/.test(lines[i])) body.push(lines[i++]);
+      while (i < lines.length && !/^```/.test(at(i))) body.push(at(i++));
       i++;
       root.append(h("pre", { class: "md-code" }, h("code", { text: body.join("\n") })));
       continue;
     }
     const heading = line.match(/^(#{1,4})\s+(.*)$/);
     if (heading) {
-      root.append(h(`h${Math.min(heading[1].length + 2, 6)}`, {}, renderInline(heading[2])));
+      root.append(h(`h${Math.min((heading[1] ?? "").length + 2, 6)}`, {}, renderInline(heading[2] ?? "")));
       i++;
       continue;
     }
     if (/^\s*([-*+]|\d+[.)])\s+/.test(line)) {
       const ordered = /^\s*\d/.test(line);
       const list = h(ordered ? "ol" : "ul");
-      while (i < lines.length && /^\s*([-*+]|\d+[.)])\s+/.test(lines[i])) {
-        list.append(h("li", {}, renderInline(lines[i].replace(/^\s*([-*+]|\d+[.)])\s+/, ""))));
+      while (i < lines.length && /^\s*([-*+]|\d+[.)])\s+/.test(at(i))) {
+        list.append(h("li", {}, renderInline(at(i).replace(/^\s*([-*+]|\d+[.)])\s+/, ""))));
         i++;
       }
       root.append(list);
       continue;
     }
     if (/^>\s?/.test(line)) {
-      const quote = [];
-      while (i < lines.length && /^>\s?/.test(lines[i])) quote.push(lines[i++].replace(/^>\s?/, ""));
+      const quote: string[] = [];
+      while (i < lines.length && /^>\s?/.test(at(i))) quote.push(at(i++).replace(/^>\s?/, ""));
       root.append(h("blockquote", {}, renderInline(quote.join(" "))));
       continue;
     }
@@ -1997,8 +2127,8 @@ function renderMarkdown(src) {
       i++;
       continue;
     }
-    const para = [];
-    while (i < lines.length && lines[i].trim() && !/^(```|#{1,4}\s|>|\s*([-*+]|\d+[.)])\s)/.test(lines[i])) para.push(lines[i++]);
+    const para: string[] = [];
+    while (i < lines.length && at(i).trim() && !/^(```|#{1,4}\s|>|\s*([-*+]|\d+[.)])\s)/.test(at(i))) para.push(at(i++));
     const p = h("p");
     para.forEach((l, n) => {
       if (n) p.append(h("br"));
@@ -2010,10 +2140,10 @@ function renderMarkdown(src) {
 }
 
 // Applies chat events to a transcript element. Streaming text re-renders once per frame.
-function chatRenderer(container, sessionId, onBusy = setChatBusy) {
-  let textEl = null;
+function chatRenderer(container: HTMLElement, sessionId: string, onBusy = setChatBusy) {
+  let textEl: HTMLElement | null = null;
   let textSrc = "";
-  let thinkingEl = null;
+  let thinkingEl: HTMLElement | null = null;
   let pending = false;
   const tools = new Map(); // tool_use id → card parts
   const scroll = () => {
@@ -2032,12 +2162,12 @@ function chatRenderer(container, sessionId, onBusy = setChatBusy) {
     textSrc = "";
     thinkingEl = null;
   };
-  const notice = (cls, text) => {
+  const notice = (cls: string, text: string) => {
     endBlocks();
     container.append(h("div", { class: `chat-notice ${cls}`, text }));
     scroll();
   };
-  const toolCard = (id, name) => {
+  const toolCard = (id: string, name: string) => {
     let t = tools.get(id);
     if (t) return t;
     endBlocks();
@@ -2050,16 +2180,16 @@ function chatRenderer(container, sessionId, onBusy = setChatBusy) {
     tools.set(id, t);
     return t;
   };
-  const respond = async (id, approved, t) => {
+  const respond = async (id: string, approved: boolean, t: ReaData) => {
     t.actions.replaceChildren(h("span", { class: "muted", text: approved ? "Approved" : "Declined" }));
     try {
       await api(`/api/chat/sessions/${sessionId}/approve`, { method: "POST", body: { toolUseId: id, approved } });
     } catch (err) {
-      t.actions.replaceChildren(h("span", { class: "chat-error-text", text: err.message }));
+      t.actions.replaceChildren(h("span", { class: "chat-error-text", text: errorMessage(err) }));
     }
   };
 
-  return function apply(ev) {
+  return function apply(ev: ReaData) {
     switch (ev.type) {
       case "user":
         endBlocks();
@@ -2163,30 +2293,30 @@ function chatRenderer(container, sessionId, onBusy = setChatBusy) {
   };
 }
 
-function setChatBusy(busy) {
+function setChatBusy(busy: boolean) {
   chatState.busy = busy;
-  const send = document.getElementById("chat-send");
+  const send = document.querySelector<HTMLElement>("#chat-send");
   if (!send) return;
   send.textContent = busy ? "Stop" : "Send";
   send.classList.toggle("primary", !busy);
   send.classList.toggle("danger", busy);
-  document.getElementById("chat-typing")?.classList.toggle("hidden", !busy);
+  document.querySelector<HTMLElement>("#chat-typing")?.classList.toggle("hidden", !busy);
 }
 
-function connectChatStream(sessionId) {
+function connectChatStream(sessionId: string) {
   chatState.es?.close();
   const es = new EventSource(`/api/chat/sessions/${encodeURIComponent(sessionId)}/stream?token=${token}`);
   chatState.es = es;
   es.addEventListener("reset", (e) => {
     const data = JSON.parse(e.data);
-    const container = document.getElementById("chat-messages");
+    const container = document.querySelector<HTMLElement>("#chat-messages");
     if (!container) return;
     container.replaceChildren();
     chatState.view = chatRenderer(container, sessionId);
     for (const ev of data.events) chatState.view(ev);
     setChatBusy(data.busy);
     const body = container.parentElement;
-    body.scrollTop = body.scrollHeight;
+    if (body) body.scrollTop = body.scrollHeight;
   });
   es.addEventListener("chat", (e) => {
     const ev = JSON.parse(e.data);
@@ -2197,7 +2327,7 @@ function connectChatStream(sessionId) {
     // The session is gone (server restarted): stop reconnecting.
     if (es.readyState === EventSource.CLOSED) return;
     api("/api/chat/sessions").then(({ sessions }) => {
-      if (!sessions.some((s) => s.id === sessionId)) {
+      if (!sessions.some((s: ReaData) => s.id === sessionId)) {
         es.close();
         setActiveChat(null);
         renderChat();
@@ -2207,7 +2337,7 @@ function connectChatStream(sessionId) {
 }
 
 function renderChatList() {
-  const list = document.getElementById("chat-list");
+  const list = document.querySelector<HTMLElement>("#chat-list");
   if (!list) return;
   list.replaceChildren(
     h("button", {
@@ -2251,9 +2381,9 @@ function renderChatList() {
   );
 }
 
-async function renderChat() {
+async function renderChat(): Promise<void> {
   // Redraws (provider switch, model list arriving, REA's tools loading) keep the half-typed message.
-  const draft = document.getElementById("chat-prompt")?.value ?? "";
+  const draft = document.querySelector<HTMLInputElement>("#chat-prompt")?.value ?? "";
   if (!chatState.config) {
     setMain(h("div", { class: "empty", text: "Loading chat…" }));
     await loadChatConfig();
@@ -2266,7 +2396,7 @@ async function renderChat() {
           h("p", { text: `Couldn't load chat settings: ${chatState.configError}` }),
           h("p", {
             class: "muted",
-            text: "If you just updated REA GUI, the web server is still running the old code. Stop it (Ctrl+C in its terminal) and run node bin/rea-gui.mjs again, then reload this page. The Restart REA button only restarts REA's tools, not this server.",
+            text: "If you just updated REA GUI, the web server is still running the old code. Stop it (Ctrl+C in its terminal) and run npm start again, then reload this page. The Restart REA button only restarts REA's tools, not this server.",
           }),
           h("button", { class: "primary", text: "Try again", onclick: () => renderChat() }),
         ),
@@ -2294,7 +2424,7 @@ async function renderChat() {
   const effortSelect = h(
     "select",
     { "aria-label": "Effort", onchange: (e) => localStorage.setItem("rea-chat-effort", (chatState.effort = e.target.value)) },
-    ...cfg.efforts.map((e) => h("option", { value: e, text: e, selected: e === chatState.effort })),
+    ...cfg.efforts.map((e: ReaData) => h("option", { value: e, text: e, selected: e === chatState.effort })),
   );
   const composer = h(
     "div",
@@ -2310,14 +2440,14 @@ async function renderChat() {
         class: "primary",
         id: "chat-send",
         text: "Send",
-        onclick: () => (chatState.busy ? api(`/api/chat/sessions/${encodeURIComponent(chatState.active)}/abort`, { method: "POST" }).catch(() => {}) : sendChatMessage()),
+        onclick: () => (chatState.busy ? api(`/api/chat/sessions/${encodeURIComponent(chatState.active ?? "")}/abort`, { method: "POST" }).catch(() => {}) : sendChatMessage()),
       }),
     ),
   );
 
   let top;
   if (active) {
-    const agent = cfg.agents.find((a) => a.id === active.agent);
+    const agent = cfg.agents.find((a: ReaData) => a.id === active.agent);
     top = h("div", { class: "chat-header" }, h("h1", { text: active.title ?? "Chat" }), h("p", { class: "muted", text: `${agent?.label ?? active.agent} · ${chatModelLabel(active)}` }));
   } else {
     top = h(
@@ -2345,18 +2475,21 @@ async function renderChat() {
 }
 
 // Provider, key, model and assistant for new chats. Existing chats keep the settings they started with.
-function chatSettings(cfg) {
+// Once a key is saved, it folds into a one-line summary.
+function chatSettings(cfg: ReaData) {
   const provider = chatProvider();
+  const rerender = () => location.hash === "#/chat" && !chatState.active && renderChat();
   const providerSelect = h(
     "select",
     {
       id: "chat-provider",
       onchange: (e) => {
         localStorage.setItem("rea-chat-provider", (chatState.provider = e.target.value));
+        chatState.settingsOpen = true;
         renderChat();
       },
     },
-    ...cfg.providers.map((p) => h("option", { value: p.id, text: p.label, selected: p.id === chatState.provider })),
+    ...cfg.providers.map((p: ReaData) => h("option", { value: p.id, text: p.label, selected: p.id === chatState.provider })),
   );
   const keyInput = h("input", {
     type: "password",
@@ -2366,92 +2499,154 @@ function chatSettings(cfg) {
     value: chatKey(),
     onchange: (e) => {
       setChatKey(e.target.value);
-      // A new key may unlock a model list that failed without one.
-      if (chatState.provider === "openrouter" && chatState.orModelsError) loadOpenRouterModels(true).then(() => location.hash === "#/chat" && renderChat());
+      // A new key unlocks the provider's model list; with a key and a model, the settings fold away.
+      if (chatState.provider !== "anthropic") delete chatState.catalogs[chatState.provider], delete chatState.catalogErrors[chatState.provider];
+      if (chatKey()) chatState.settingsOpen = false;
+      (chatState.provider === "anthropic" ? Promise.resolve() : loadModels()).then(() => void rerender());
     },
   });
-  const keyHelp =
-    chatState.provider === "openrouter"
-      ? h("small", { class: "muted" }, "Create one at ", h("a", { href: "https://openrouter.ai/settings/keys", target: "_blank", rel: "noopener", text: "openrouter.ai/settings/keys" }), ". Stored in this browser only and sent to your local REA GUI server.")
-      : h("small", { class: "muted" }, "Create one at ", h("a", { href: "https://platform.claude.com/settings/keys", target: "_blank", rel: "noopener", text: "platform.claude.com" }), ". Stored in this browser only and sent to your local REA GUI server.");
+  const keyHelp = h(
+    "small",
+    { class: "muted" },
+    ...(provider.keyUrl ? ["Create one at ", h("a", { href: provider.keyUrl, target: "_blank", rel: "noopener", text: new URL(provider.keyUrl).host }), ". "] : []),
+    "Stored in this browser only and sent to your REA GUI server.",
+  );
   const agentSelect = h(
     "select",
     { id: "chat-agent", onchange: (e) => localStorage.setItem("rea-chat-agent", (chatState.agent = e.target.value)) },
-    ...cfg.agents.map((a) => h("option", { value: a.id, text: a.label, title: a.description, selected: a.id === chatState.agent })),
+    ...cfg.agents.map((a: ReaData) => h("option", { value: a.id, text: a.label, title: a.description, selected: a.id === chatState.agent })),
   );
-  return h(
-    "div",
-    { class: "chat-settings" },
-    h("label", { class: "chat-field" }, h("span", { text: "Provider" }), providerSelect),
-    h("label", { class: "chat-field" }, h("span", { text: provider.keyLabel }), keyInput, keyHelp),
-    chatState.provider === "openrouter" ? openRouterModelField() : h("label", { class: "chat-field" }, h("span", { text: "Model" }), h("select", { id: "chat-model", onchange: (e) => localStorage.setItem("rea-chat-model", (chatState.model = e.target.value)) }, ...cfg.models.map((m) => h("option", { value: m.id, text: m.label, title: m.note, selected: m.id === chatState.model })))),
-    h("label", { class: "chat-field" }, h("span", { text: "Assistant" }), agentSelect),
+  const open = chatState.settingsOpen ?? !hasChatKey();
+  const box = h(
+    "details",
+    { class: "chat-settings-box", open },
+    h(
+      "summary",
+      { class: "chat-settings-summary" },
+      h("span", { class: "grow" }, h("strong", { text: provider.label.replace(/ \(.*\)$/, "") }), " · ", chatModel() ? modelLabel(chatState.provider, chatModel()) : "No model chosen", " · ", cfg.agents.find((a: ReaData) => a.id === chatState.agent)?.label ?? ""),
+      h("span", { class: `badge ${hasChatKey() ? "" : "warn"}`, text: hasChatKey() ? (chatKey() ? "Key saved" : "Server key") : "Needs a key" }),
+      h("span", { class: "chat-settings-toggle", text: open ? "Hide" : "Change" }),
+    ),
+    h(
+      "div",
+      { class: "chat-settings" },
+      h("label", { class: "chat-field" }, h("span", { text: "Provider" }), providerSelect),
+      h("label", { class: "chat-field" }, h("span", { text: provider.keyLabel }), keyInput, keyHelp),
+      ...modelFields(cfg),
+      h("label", { class: "chat-field" }, h("span", { text: "Assistant" }), agentSelect),
+      h(
+        "div",
+        { class: "chat-settings-actions" },
+        h("button", {
+          class: "primary",
+          type: "button",
+          text: "Save",
+          onclick: () => {
+            // Fields save as they change; this commits anything still being typed and folds the settings.
+            const key = document.querySelector<HTMLInputElement>("#chat-key");
+            if (key && key.value.trim() !== chatKey()) setChatKey(key.value);
+            const typed = document.querySelector<HTMLInputElement>("#chat-model");
+            if (typed?.tagName === "INPUT" && typed.value.trim()) setChatModel(typed.value);
+            chatState.settingsOpen = !hasChatKey();
+            if (chatState.provider !== "anthropic" && !chatState.catalogs[chatState.provider]) delete chatState.catalogErrors[chatState.provider];
+            (chatState.provider === "anthropic" || chatState.catalogs[chatState.provider] ? Promise.resolve() : loadModels()).then(renderChat);
+          },
+        }),
+      ),
+    ),
   );
+  box.addEventListener("toggle", () => {
+    chatState.settingsOpen = box.open;
+    box.querySelector(".chat-settings-toggle")!.textContent = box.open ? "Hide" : "Change";
+  });
+  return box;
 }
 
-// OpenRouter lists hundreds of models: a searchable field, with the chosen model's price underneath.
-function openRouterModelField() {
-  const field = h("label", { class: "chat-field chat-field-wide" }, h("span", { text: "Model" }));
-  if (!chatState.orModels && !chatState.orModelsError) {
-    field.append(h("input", { disabled: true, placeholder: "Loading OpenRouter models…" }));
-    loadOpenRouterModels().then(() => location.hash === "#/chat" && !chatState.active && renderChat());
-    return field;
-  }
-  if (chatState.orModelsError) {
-    const input = h("input", { id: "chat-model", value: chatState.orModel, placeholder: "e.g. anthropic/claude-sonnet-5.5", onchange: (e) => localStorage.setItem("rea-chat-openrouter-model", (chatState.orModel = e.target.value.trim())) });
-    field.append(input, h("small", { class: "chat-error-text" }, `${chatState.orModelsError} You can still type a model ID. `, h("button", { class: "link", type: "button", text: "Try again", onclick: () => ((chatState.orModelsError = null), renderChat()) })));
-    return field;
-  }
-  const models = chatState.orModels;
-  const note = h("small", { class: "muted" });
-  const describe = (id) => {
-    const m = models.find((x) => x.id === id);
-    const matches = id ? models.filter((x) => `${x.id} ${x.label}`.toLowerCase().includes(id.toLowerCase())).length : 0;
-    note.textContent = m
-      ? [m.label, m.note, m.reasoning ? "supports reasoning" : null].filter(Boolean).join(" · ")
-      : !id
-        ? `${models.length} tool-capable models. Type to search by name or ID.`
-        : matches
-          ? `${matches} matching models. Pick one from the list.`
-          : "Not in OpenRouter's list of tool-capable models; chats may fail.";
+// The model picker for the current provider. OpenRouter's hundreds of models are split by maker.
+function modelFields(cfg: ReaData) {
+  const id = chatState.provider;
+  const field = (label: string, ...children: Child[]) => h("label", { class: "chat-field" }, h("span", { text: label }), ...children);
+  const choose = (value: ReaData) => {
+    setChatModel(value);
+    document.querySelector(".chat-settings-summary .grow")?.replaceChildren(h("strong", { text: chatProvider().label.replace(/ \(.*\)$/, "") }), " · ", modelLabel(id, value), " · ", cfg.agents.find((a: ReaData) => a.id === chatState.agent)?.label ?? "");
   };
-  const list = h("datalist", { id: "openrouter-models" }, ...models.map((m) => h("option", { value: m.id, label: m.note ? `${m.label} · ${m.note}` : m.label })));
-  const input = h("input", {
-    id: "chat-model",
-    list: "openrouter-models",
-    value: chatState.orModel,
-    spellcheck: false,
-    autocomplete: "off",
-    placeholder: "Search models, e.g. claude, gpt, gemini, qwen",
-    oninput: (e) => describe(e.target.value.trim()),
-    onchange: (e) => localStorage.setItem("rea-chat-openrouter-model", (chatState.orModel = e.target.value.trim())),
-  });
-  describe(chatState.orModel);
-  field.append(input, list, note);
-  return field;
+  if (id === "anthropic") {
+    return [field("Model", h("select", { id: "chat-model", onchange: (e) => choose(e.target.value) }, ...cfg.models.map((m: ReaData) => h("option", { value: m.id, text: m.label, title: m.note, selected: m.id === chatModel() }))))];
+  }
+  const models = chatState.catalogs[id];
+  const error = chatState.catalogErrors[id];
+  if (!models && !error) {
+    if (!hasChatKey() && id !== "openrouter") return [field("Model", h("input", { disabled: true, placeholder: "Add your key to see models" }))];
+    loadModels().then(() => void (location.hash === "#/chat" && !chatState.active && renderChat()));
+    return [field("Model", h("input", { disabled: true, placeholder: `Loading ${chatProvider().label.replace(/ \(.*\)$/, "")} models…` }))];
+  }
+  if (error || !models?.length) {
+    const input = h("input", { id: "chat-model", value: chatModel(), spellcheck: false, placeholder: id === "openrouter" ? "e.g. anthropic/claude-sonnet-5.5" : "Model ID", onchange: (e) => choose(e.target.value) });
+    return [field("Model", input, h("small", { class: "chat-error-text" }, `${error ?? "No chat models found for this key."} You can still type a model ID. `, h("button", { class: "link", type: "button", text: "Try again", onclick: () => (delete chatState.catalogErrors[id], delete chatState.catalogs[id], renderChat()) })))];
+  }
+  if (id !== "openrouter") {
+    const current = chatModel();
+    const options = models.some((m: ReaData) => m.id === current) ? models : [{ id: current, label: current }, ...models];
+    return [field("Model", h("select", { id: "chat-model", onchange: (e) => choose(e.target.value) }, ...options.map((m: ReaData) => h("option", { value: m.id, text: m.label, selected: m.id === current }))))];
+  }
+
+  // OpenRouter: pick the maker, then the model; the price and context size show underneath.
+  const vendors = [...new Set(models.map((m: ReaData) => m.vendor))];
+  const counts = Object.fromEntries(vendors.map((v) => [v, models.filter((m: ReaData) => m.vendor === v).length]));
+  const current = models.find((m: ReaData) => m.id === chatModel());
+  let vendor = current?.vendor ?? vendors[0];
+  const note = h("small", { class: "muted" });
+  const describe = () => {
+    const m = models.find((x: ReaData) => x.id === chatModel());
+    note.textContent = m ? [m.id, m.note, m.reasoning ? "supports reasoning" : null].filter(Boolean).join(" · ") : `${chatModel()} isn't in OpenRouter's list of tool-capable models; chats may fail.`;
+  };
+  const modelSelect = h("select", { id: "chat-model", onchange: (e) => (choose(e.target.value), describe()) });
+  const fillModels = () => {
+    const list = models.filter((m: ReaData) => m.vendor === vendor);
+    if (!list.some((m: ReaData) => m.id === chatModel())) {
+      // Switching maker picks its newest strong model, or its first.
+      const pick = (MODEL_DEFAULTS.openrouter ?? []).map((re) => list.filter((m: ReaData) => re.test(m.id)).sort(newestFirst)[0]).find(Boolean) ?? list[0];
+      if (pick) choose(pick.id);
+    }
+    modelSelect.replaceChildren(...list.map((m: ReaData) => h("option", { value: m.id, text: m.label, selected: m.id === chatModel() })));
+    describe();
+  };
+  const vendorSelect = h(
+    "select",
+    { id: "chat-vendor", onchange: (e) => ((vendor = e.target.value), fillModels()) },
+    ...(current ? [] : [h("option", { value: "", text: "Choose a maker", selected: true, disabled: true })]),
+    ...vendors.map((v) => h("option", { value: v, text: `${v} (${counts[v]})`, selected: v === current?.vendor })),
+  );
+  if (current) fillModels();
+  else {
+    modelSelect.append(h("option", { value: chatModel(), text: chatModel() || "Choose a model", selected: true }));
+    describe();
+  }
+  return [field("Model maker", vendorSelect, h("small", { class: "muted", text: `${models.length} tool-capable models on OpenRouter.` })), field("Model", modelSelect, note)];
 }
 
 async function sendChatMessage() {
-  const prompt = document.getElementById("chat-prompt");
+  const prompt = document.querySelector<HTMLInputElement>("#chat-prompt");
   const text = prompt?.value.trim();
-  if (!text) return;
   const cfg = chatState.config;
-  const showError = (message) => {
-    document.getElementById("chat-messages")?.append(h("div", { class: "chat-notice error", text: message }));
+  if (!prompt || !text || !cfg) return;
+  const showError = (message: string) => {
+    document.querySelector<HTMLElement>("#chat-messages")?.append(h("div", { class: "chat-notice error", text: message }));
   };
 
   if (!chatState.active) {
     // The model field commits on change; read it directly in case it still has focus.
-    const typed = document.getElementById("chat-model")?.value?.trim();
-    if (typed && chatState.provider === "openrouter") localStorage.setItem("rea-chat-openrouter-model", (chatState.orModel = typed));
-    const keyField = document.getElementById("chat-key");
+    const typed = document.querySelector<HTMLInputElement>("#chat-model")?.value?.trim();
+    if (typed && typed !== chatModel()) setChatModel(typed);
+    const keyField = document.querySelector<HTMLInputElement>("#chat-key");
     if (keyField && keyField.value.trim() !== chatKey()) setChatKey(keyField.value);
     const problem = chatSetupProblem();
     if (problem) {
       showError(problem);
+      document.querySelector(".chat-settings-box")?.setAttribute("open", "");
       return document.getElementById(hasChatKey() ? "chat-model" : "chat-key")?.focus();
     }
-    const agent = cfg.agents.find((a) => a.id === chatState.agent);
+    const agent = cfg.agents.find((a: ReaData) => a.id === chatState.agent);
     if (agent?.usesRea && state.status?.state !== "ready") return showError("REA isn't running yet. Wait for it to start, or restart it from the top bar.");
     try {
       const sess = await api("/api/chat/sessions", { method: "POST", body: newChatBody({ agent: chatState.agent }) });
@@ -2459,24 +2654,26 @@ async function sendChatMessage() {
       prompt.value = "";
       await renderChat(); // switches to the session view and opens its stream
     } catch (err) {
-      return showError(err.message);
+      return showError(errorMessage(err));
     }
   } else {
     prompt.value = "";
   }
   try {
     setChatBusy(true);
-    await api(`/api/chat/sessions/${encodeURIComponent(chatState.active)}/message`, { method: "POST", body: { message: text, effort: chatState.effort } });
+    await api(`/api/chat/sessions/${encodeURIComponent(chatState.active ?? "")}/message`, { method: "POST", body: { message: text, effort: chatState.effort } });
   } catch (err) {
     setChatBusy(false);
-    document.getElementById("chat-prompt").value = text;
-    showError(err.message);
+    // The chat may have been redrawn, so put the message back in the current box.
+    const field = document.querySelector<HTMLInputElement>("#chat-prompt");
+    if (field) field.value = text;
+    showError(errorMessage(err));
   }
 }
 
 // Below the sidebar breakpoint the sidebar is a drawer opened from the top bar.
 const sidebarQuery = matchMedia("(max-width: 900px)");
-function setSidebarOpen(open) {
+function setSidebarOpen(open: boolean) {
   document.body.classList.toggle("sidebar-open", open);
   $("#sidebar-toggle").setAttribute("aria-expanded", String(open));
   $("#sidebar-backdrop").hidden = !open;

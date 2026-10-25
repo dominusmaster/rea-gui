@@ -5,13 +5,13 @@ import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { fileURLToPath } from "node:url";
 import assert from "node:assert/strict";
+import { type Json, must, pageToken, sleep } from "./helpers.ts";
 
 const port = 4596;
-const bin = fileURLToPath(new URL("../bin/rea-gui.mjs", import.meta.url));
-const fake = fileURLToPath(new URL("./fake-mcp.mjs", import.meta.url));
+const bin = fileURLToPath(new URL("../dist/bin/rea-gui.js", import.meta.url));
+const fake = fileURLToPath(new URL("./fake-mcp.ts", import.meta.url));
 const dataDir = mkdtempSync(join(tmpdir(), "rea-gui-server-"));
 const base = `http://127.0.0.1:${port}`;
-const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
 const env = { ...process.env, REA_BIN: fake, REA_NODE: process.execPath, REA_GUI_DATA_DIR: dataDir, REA_GUI_PASSWORD: "", REA_GUI_ALLOW_NO_PASSWORD: "" };
 
 // No password on a public address: refuse, and say why.
@@ -39,19 +39,20 @@ try {
   assert.equal((await fetch(`${base}/app.js`)).status, 404, "app code needs sign-in");
   const api = await fetch(`${base}/api/status`);
   assert.equal(api.status, 401);
-  assert.equal((await api.json()).signIn, true);
+  assert.equal(((await api.json()) as Json).signIn, true);
 
-  const login = (password) => fetch(`${base}/api/login`, { method: "POST", headers: { "content-type": "application/json" }, body: JSON.stringify({ password }) });
+  const login = (password: string) => fetch(`${base}/api/login`, { method: "POST", headers: { "content-type": "application/json" }, body: JSON.stringify({ password }) });
   assert.equal((await login("wrong")).status, 401);
   const ok = await login("correct horse");
   assert.equal(ok.status, 200);
-  const cookie = ok.headers.get("set-cookie").split(";")[0];
-  assert.match(ok.headers.get("set-cookie"), /HttpOnly; SameSite=Strict/);
+  const setCookie = must(ok.headers.get("set-cookie"), "a session cookie");
+  const cookie = setCookie.split(";")[0] ?? "";
+  assert.match(setCookie, /HttpOnly; SameSite=Strict/);
 
   const html = await (await fetch(base, { headers: { cookie } })).text();
   assert.match(html, /name="rea-gui-mode" content="server"/);
   assert.match(html, /name="rea-gui-auth" content="password"/);
-  const token = html.match(/name="rea-gui-token" content="([0-9a-f]+)"/)[1];
+  const token = pageToken(html);
   const headers = { cookie, "x-rea-gui-token": token };
   assert.equal((await fetch(`${base}/api/status`, { headers: { cookie } })).status, 401, "the page token is still required");
   assert.equal((await fetch(`${base}/api/status`, { headers })).status, 200);
@@ -59,11 +60,11 @@ try {
   // Uploads keep the file name, in their own folder; oversized ones leave nothing behind.
   const up = await fetch(`${base}/api/upload?name=${encodeURIComponent("../evil/app.apk")}`, { method: "POST", headers, body: Buffer.from("PK\x03\x04hello") });
   assert.equal(up.status, 201);
-  const saved = await up.json();
+  const saved: Json = await up.json();
   assert.ok(saved.path.startsWith(join(dataDir, "uploads")), "stays inside the uploads folder");
   assert.equal(saved.name, ".._evil_app.apk".replace(/^\.+/, ""), "path separators can't escape");
   assert.equal(readFileSync(saved.path, "utf8"), "PK\x03\x04hello");
-  assert.equal((await (await fetch(`${base}/api/detect?path=${encodeURIComponent(saved.path)}`, { headers })).json()).exists, true);
+  assert.equal(((await (await fetch(`${base}/api/detect?path=${encodeURIComponent(saved.path)}`, { headers })).json()) as Json).exists, true);
   const big = await fetch(`${base}/api/upload?name=big.bin`, { method: "POST", headers, body: Buffer.alloc(2 * 1024 * 1024) }).catch((err) => ({ status: "closed", err }));
   assert.ok(big.status === 413 || big.status === "closed", `oversized upload refused (${big.status})`);
   await sleep(200);

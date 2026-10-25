@@ -1,37 +1,88 @@
 // Minimal MCP stdio client: newline-delimited JSON-RPC 2.0 over a child process.
-import { spawn } from "node:child_process";
+import { spawn, type ChildProcessWithoutNullStreams } from "node:child_process";
 import { EventEmitter } from "node:events";
+import { errorMessage, type McpTool, type OnProgress, type ProgressParams } from "./types.js";
 
 const PROTOCOL_VERSION = "2025-06-18";
 
+export interface McpLaunch {
+  command: string;
+  args: string[];
+  env?: NodeJS.ProcessEnv;
+  cwd?: string;
+}
+
+export type McpState = "stopped" | "starting" | "ready" | "failed";
+
+interface Pending {
+  resolve: (value: any) => void;
+  reject: (err: Error) => void;
+  onProgress: OnProgress | undefined;
+}
+
+interface RpcMessage {
+  jsonrpc: "2.0";
+  id?: number | string;
+  method?: string;
+  params?: any;
+  result?: any;
+  error?: { code: number; message: string; data?: unknown };
+}
+
+/** An MCP error response, with JSON-RPC's code and data. */
+export class McpError extends Error {
+  code: number;
+  data: unknown;
+  constructor(error: { code: number; message: string; data?: unknown }) {
+    super(error.message);
+    this.code = error.code;
+    this.data = error.data;
+  }
+}
+
+export interface InitializeResult {
+  protocolVersion: string;
+  serverInfo?: { name: string; version: string };
+  instructions?: string;
+}
+
 export class McpStdioClient extends EventEmitter {
-  constructor({ command, args, env, cwd }) {
+  command: string;
+  args: string[];
+  env: NodeJS.ProcessEnv | undefined;
+  cwd: string | undefined;
+  nextId = 1;
+  pending = new Map<number | string, Pending>();
+  stderrTail: string[] = [];
+  state: McpState = "stopped";
+  serverInfo: InitializeResult["serverInfo"] | null = null;
+  protocolVersion: string | null = null;
+  instructions: string | null = null;
+  error: string | null = null;
+  child: ChildProcessWithoutNullStreams | null = null;
+
+  constructor({ command, args, env, cwd }: McpLaunch) {
     super();
     this.command = command;
     this.args = args;
     this.env = env;
     this.cwd = cwd;
-    this.nextId = 1;
-    this.pending = new Map();
-    this.stderrTail = [];
-    this.state = "stopped";
-    this.serverInfo = null;
-    this.error = null;
   }
 
-  async start() {
+  async start(): Promise<InitializeResult> {
     this.state = "starting";
     this.error = null;
     this.emit("status");
-    this.child = spawn(this.command, this.args, {
+    const child = spawn(this.command, this.args, {
       env: this.env,
-      cwd: this.cwd,
+      ...(this.cwd ? { cwd: this.cwd } : {}),
       stdio: ["pipe", "pipe", "pipe"],
     });
+    this.child = child;
 
     let buffer = "";
-    this.child.stdout.setEncoding("utf8");
-    this.child.stdout.on("data", (chunk) => {
+    child.stdout.setEncoding("utf8");
+    child.stdout.on("data", (chunk: string) => {
       buffer += chunk;
       let newline;
       while ((newline = buffer.indexOf("\n")) !== -1) {
@@ -41,8 +92,8 @@ export class McpStdioClient extends EventEmitter {
       }
     });
 
-    this.child.stderr.setEncoding("utf8");
-    this.child.stderr.on("data", (chunk) => {
+    child.stderr.setEncoding("utf8");
+    child.stderr.on("data", (chunk: string) => {
       for (const line of chunk.split("\n")) {
         if (!line.trim()) continue;
         this.stderrTail.push(line);
@@ -51,9 +102,9 @@ export class McpStdioClient extends EventEmitter {
       }
     });
 
-    const exited = new Promise((_, reject) => {
-      this.child.once("error", (err) => reject(err));
-      this.child.once("exit", (code, signal) => {
+    const exited = new Promise<never>((_, reject) => {
+      child.once("error", (err) => reject(err));
+      child.once("exit", (code, signal) => {
         const err = new Error(`REA MCP server exited (code ${code}, signal ${signal})`);
         this.state = "stopped";
         this.error = err.message;
@@ -67,7 +118,7 @@ export class McpStdioClient extends EventEmitter {
 
     try {
       const result = await Promise.race([
-        this.request("initialize", {
+        this.request<InitializeResult>("initialize", {
           protocolVersion: PROTOCOL_VERSION,
           capabilities: {},
           clientInfo: { name: "rea-gui", version: "0.1.0" },
@@ -83,67 +134,66 @@ export class McpStdioClient extends EventEmitter {
       return result;
     } catch (err) {
       this.state = "failed";
-      this.error = err.message;
+      this.error = errorMessage(err);
       this.emit("status");
       this.stop();
       throw err;
     }
   }
 
-  stop() {
+  stop(): void {
     if (this.child && this.child.exitCode === null) this.child.kill();
   }
 
-  #send(message) {
+  #send(message: RpcMessage): void {
     if (!this.child || this.child.exitCode !== null) {
       throw new Error("REA MCP server is not running");
     }
     this.child.stdin.write(`${JSON.stringify(message)}\n`);
   }
 
-  request(method, params, { onProgress } = {}) {
+  request<T = any>(method: string, params?: object, { onProgress }: { onProgress?: OnProgress | undefined } = {}): { id: number; promise: Promise<T> } {
     const id = this.nextId++;
-    const message = { jsonrpc: "2.0", id, method };
+    const message: RpcMessage = { jsonrpc: "2.0", id, method };
     if (params !== undefined) message.params = params;
     if (onProgress) {
       message.params = { ...message.params, _meta: { progressToken: id } };
     }
-    const promise = new Promise((resolve, reject) => {
+    const promise = new Promise<T>((resolve, reject) => {
       this.pending.set(id, { resolve, reject, onProgress });
     });
     this.#send(message);
     return { id, promise };
   }
 
-  notify(method, params) {
-    const message = { jsonrpc: "2.0", method };
+  notify(method: string, params?: object): void {
+    const message: RpcMessage = { jsonrpc: "2.0", method };
     if (params !== undefined) message.params = params;
     this.#send(message);
   }
 
-  cancel(id, reason = "Cancelled from REA GUI") {
-    if (!this.pending.has(id)) return false;
+  cancel(id: number, reason = "Cancelled from REA GUI"): boolean {
+    const pending = this.pending.get(id);
+    if (!pending) return false;
     this.notify("notifications/cancelled", { requestId: id, reason });
-    const { reject } = this.pending.get(id);
     this.pending.delete(id);
-    reject(new Error(reason));
+    pending.reject(new Error(reason));
     return true;
   }
 
-  async listTools() {
-    const tools = [];
-    let cursor;
+  async listTools(): Promise<McpTool[]> {
+    const tools: McpTool[] = [];
+    let cursor: string | undefined;
     do {
-      const { promise } = this.request("tools/list", cursor ? { cursor } : {});
-      const page = await promise;
+      const page = await this.request<{ tools: McpTool[]; nextCursor?: string }>("tools/list", cursor ? { cursor } : {}).promise;
       tools.push(...page.tools);
       cursor = page.nextCursor;
     } while (cursor);
     return tools;
   }
 
-  #handleLine(line) {
-    let message;
+  #handleLine(line: string): void {
+    let message: RpcMessage;
     try {
       message = JSON.parse(line);
     } catch {
@@ -156,14 +206,8 @@ export class McpStdioClient extends EventEmitter {
       const pending = this.pending.get(message.id);
       if (!pending) return;
       this.pending.delete(message.id);
-      if (message.error) {
-        const err = new Error(message.error.message);
-        err.code = message.error.code;
-        err.data = message.error.data;
-        pending.reject(err);
-      } else {
-        pending.resolve(message.result);
-      }
+      if (message.error) pending.reject(new McpError(message.error));
+      else pending.resolve(message.result);
       return;
     }
 
@@ -182,8 +226,9 @@ export class McpStdioClient extends EventEmitter {
     }
 
     if (message.method === "notifications/progress") {
-      const pending = this.pending.get(message.params?.progressToken);
-      pending?.onProgress?.(message.params);
+      const params = message.params as ProgressParams | undefined;
+      const pending = params?.progressToken === undefined ? undefined : this.pending.get(params.progressToken);
+      if (params) pending?.onProgress?.(params);
       return;
     }
     if (message.method === "notifications/message") {

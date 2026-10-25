@@ -29,9 +29,9 @@ Run it on your own computer, or deploy it to a server and use it from a browser.
   card per check with findings, key numbers, drill-downs and REA's full evidence.
   Analyses are saved, so they reopen later without running again.
 - **Chat.** Ask questions about an app; the assistant finds and runs REA's tools and
-  asks before anything that changes state. Works with Claude through the
-  [Anthropic API](https://platform.claude.com/), or any tool-capable model on
-  [OpenRouter](https://openrouter.ai/).
+  asks before anything that changes state. Works with Anthropic (Claude), OpenAI,
+  Google Gemini, xAI (Grok) and DeepSeek using your own API key, or any tool-capable
+  model on [OpenRouter](https://openrouter.ai/).
 - **Tool library.** All of REA's 200+ tools, each with a form generated from its
   schema, examples, live progress and cancellation.
 
@@ -108,14 +108,13 @@ Behind a proxy, also set `REA_GUI_TRUST_PROXY=1` so sign-in limits apply per vis
 | `REA_GUI_DATA_DIR` | Where saved analyses and uploads are kept (default `~/.rea-gui`; `/data` in Docker). |
 | `REA_GUI_MAX_UPLOAD_MB` | Largest upload (default 4096). |
 | `REA_GUI_TRUST_PROXY` | Set to `1` behind a reverse proxy. |
-| `ANTHROPIC_API_KEY`, `OPENROUTER_API_KEY` | Chat keys for everyone using this REA GUI, instead of each person entering their own. |
+| `ANTHROPIC_API_KEY`, `OPENAI_API_KEY`, `GEMINI_API_KEY`, `XAI_API_KEY`, `DEEPSEEK_API_KEY`, `OPENROUTER_API_KEY` | Chat keys for everyone using this REA GUI, instead of each person entering their own. |
 | `REA_BIN`, `REA_NODE` | Use a specific REA (for example, a source checkout) or Node for REA. |
 
 ## Chat keys
 
-Open **Chat**, choose **Anthropic** or **OpenRouter**, and paste your key
-([Anthropic keys](https://platform.claude.com/settings/keys),
-[OpenRouter keys](https://openrouter.ai/settings/keys)). Keys entered there are stored
+Open **Chat**, choose a provider (Anthropic, OpenAI, Google Gemini, xAI, DeepSeek or
+OpenRouter) and paste your key. Each provider's settings link to where you create one. Keys entered there are stored
 in your browser and sent only to your REA GUI server, which uses them to call the
 provider. On a shared server, anyone signed in can use keys set in the server's
 environment.
@@ -152,9 +151,14 @@ and by laws on circumventing technical protections.
 
 ## Development
 
+REA GUI is written in TypeScript with the same strict settings as REA. `src/bin` and
+`src/lib` are the server, `src/web` the browser code; both compile to `dist/`.
+
 ```bash
 npm install
-npm test     # end-to-end tests against a fake REA, Anthropic and OpenRouter
+npm run build      # compile src/ to dist/ (npm start does this first)
+npm run typecheck  # type-check the server, browser code and tests
+npm test           # type-check, build, then end-to-end tests against a fake REA and fake providers
 npm start
 ```
 
