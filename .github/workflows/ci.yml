@@ -1,0 +1,65 @@
+# Checks REA GUI on every push and pull request:
+# type-check, build and end-to-end tests on the Node versions REA supports,
+# then the Docker image a server would run.
+name: CI
+
+on:
+  push:
+    branches: [main, saved-analyses]
+  pull_request:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: ci-${{ github.ref }}
+  cancel-in-progress: true
+
+defaults:
+  run:
+    working-directory: rea-gui
+
+jobs:
+  test:
+    name: Test (Node ${{ matrix.node }})
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    strategy:
+      fail-fast: false
+      matrix:
+        node: [22, 24]
+    steps:
+      - uses: actions/checkout@v5
+      - uses: actions/setup-node@v5
+        with:
+          node-version: ${{ matrix.node }}
+          cache: npm
+          cache-dependency-path: rea-gui/package-lock.json
+      - run: npm ci
+      # pretest type-checks the server, browser code and tests, then builds dist/.
+      - run: npm test
+
+  docker:
+    name: Docker image
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    steps:
+      - uses: actions/checkout@v5
+      - name: Build
+        run: docker build -t rea-gui:ci .
+      - name: Start and check health
+        run: |
+          docker run -d --name rea-gui -p 4517:4517 -e REA_GUI_PASSWORD=ci-only rea-gui:ci
+          for i in $(seq 1 30); do
+            if curl -fsS http://127.0.0.1:4517/healthz | grep -q '"rea":"ready"'; then
+              echo "REA GUI is up and REA is ready"; exit 0
+            fi
+            sleep 3
+          done
+          docker logs rea-gui
+          exit 1
+      - name: Sign-in is required
+        run: |
+          test "$(curl -s -o /dev/null -w '%{http_code}' http://127.0.0.1:4517/)" = 302
+          test "$(curl -s -o /dev/null -w '%{http_code}' -H 'content-type: application/json' -d '{"password":"wrong"}' http://127.0.0.1:4517/api/login)" = 401

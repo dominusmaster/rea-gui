@@ -13,6 +13,11 @@ Run it on your own computer, or deploy it to a server and use it from a browser.
 
 ## What it does
 
+<picture>
+  <source media="(prefers-color-scheme: light)" srcset="docs/screenshots/analysis-light.png">
+  <img src="docs/screenshots/analysis-dark.png" alt="REA GUI analyzing GitHub Desktop">
+</picture>
+
 - **Guided analysis.** Paste a path, pick an installed app, or (on a server) upload a
   file. REA GUI works out what it is and runs the right REA checks in order:
 
@@ -161,6 +166,10 @@ npm run typecheck  # type-check the server, browser code and tests
 npm test           # type-check, build, then end-to-end tests against a fake REA and fake providers
 npm start
 ```
+
+GitHub Actions ([`.github/workflows/ci.yml`](../.github/workflows/ci.yml)) runs the
+type-check, build and tests on Node 22 and 24 for every push and pull request, and builds
+the Docker image and checks that it starts and requires sign-in.
 
 ## License
 
