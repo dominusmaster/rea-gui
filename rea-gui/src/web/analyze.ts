@@ -434,7 +434,7 @@ export function recipeFor(kind: string): Step[] {
 }
 
 // Short type marks for the header when there's no app icon.
-const MARKS: Record<string, string> = { electron: "APP", "mac-app": "APP", android: "APK", ios: "IPA", js: "JS", windows: "EXE", "mach-o": "BIN", elf: "ELF", wasm: "WASM", sqlite: "DB", archive: "ZIP" };
+export const MARKS: Record<string, string> = { electron: "APP", "mac-app": "APP", android: "APK", ios: "IPA", js: "JS", windows: "EXE", "mach-o": "BIN", elf: "ELF", wasm: "WASM", sqlite: "DB", archive: "ZIP" };
 const when = (ms: number) => new Date(ms).toLocaleString(undefined, { dateStyle: "medium", timeStyle: "short" });
 
 // ---------- analysis page ----------

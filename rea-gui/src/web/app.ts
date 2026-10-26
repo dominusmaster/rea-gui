@@ -1,6 +1,6 @@
 // REA GUI frontend. All target-derived text is rendered with textContent, never innerHTML.
 import { isEvidence, renderEvidence, drillPanel, renderFacts } from "/evidence.js";
-import { classify, KINDS, runAnalysis, restoreAnalysis, type Analysis } from "/analyze.js";
+import { classify, KINDS, MARKS, runAnalysis, restoreAnalysis, type Analysis } from "/analyze.js";
 import { h, $, $opt, errorMessage, type CallRecord, type Child, type EvidenceContext, type FieldEvent, type JsonTree, type Props, type ReaData, type Tool } from "/dom.js";
 const token = document.querySelector<HTMLMetaElement>('meta[name="rea-gui-token"]')?.content ?? "";
 // "server": REA GUI runs on another machine, so files are uploaded rather than picked from this computer.
@@ -1044,12 +1044,19 @@ function renderAnalysisList() {
       h(
         "button",
         { class: `nav-item analysis-item ${location.hash === `#/analysis/${a.id}` ? "active" : ""}`, title: why[shownState(a)] ? `${a.path}\n${why[shownState(a)]}` : a.path, onclick: () => (location.hash = `#/analysis/${a.id}`) },
-        h("span", { class: `state ${shownState(a)}`, text: icon[shownState(a)] ?? "•" }),
+        analysisAvatar(a, h("span", { class: `state ${shownState(a)}`, "aria-hidden": "true", text: icon[shownState(a)] ?? "•" })),
         h("span", { class: "grow", text: a.name }),
         h("span", { class: "type", text: KINDS[a.kind]?.label ?? "" }),
       ),
     );
   }
+}
+
+// The app's own icon when it has one (macOS .app), else its kind mark; the analysis state sits on it as a badge.
+function analysisAvatar(a: ReaData, badge: HTMLElement) {
+  const mark = () => h("span", { class: "kind-icon small", text: MARKS[a.kind] ?? "?" });
+  const face = String(a.path ?? "").endsWith(".app") ? h("img", { class: "app-icon small", alt: "", src: iconUrl(a.path), onerror: (e: Event) => (e.target as HTMLElement).replaceWith(mark()) }) : mark();
+  return h("span", { class: "avatar" }, face, badge);
 }
 
 async function renderAnalysisPage(id: string) {
